@@ -8,17 +8,26 @@ create table if not exists saj_plant (
   pv_power_wp    numeric,
   running_state  text,
   type_name      text,
+  customer_id    text,           -- FK -> customer(customer_id) ON DELETE SET NULL; 1 customer -> many plants
   updated_at     timestamptz default now()
 );
 
 create table if not exists saj_device (
-  device_sn   text primary key,
-  plant_uid   text,
-  device_type text,
-  alias       text,
-  last_seen   timestamptz,
-  updated_at  timestamptz default now()
+  device_sn      text primary key,
+  plant_uid      text,
+  device_type    text,           -- numeric category code from the portal
+  alias          text,
+  -- human-readable model info (from baseInverterDetail; filled lazily on fetch)
+  model          text,           -- e.g. 'C6-100K-T9'
+  rated_power_kw numeric,         -- e.g. 100
+  phase_name     text,           -- 'Single-Phase' | 'Three-Phase'
+  firmware       text,           -- e.g. 'v6.716'
+  image_url      text,           -- product photo URL
+  last_seen      timestamptz,
+  updated_at     timestamptz default now()
 );
+
+create index if not exists saj_plant_customer_idx on saj_plant (customer_id);
 
 create table if not exists saj_customer_device_map (
   id           bigserial primary key,

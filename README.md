@@ -20,6 +20,7 @@ upserts them into Postgres.
 | `POST` | `/fetch/device/{device_sn}?days=1` | Same for one inverter serial (adds `latest`) |
 | `GET`  | `/plant/{plant_uid}/series?days=1` | Chart data straight from prod — no SAJ call, no token |
 | `GET`  | `/device/{device_sn}/series?days=1` | Same, one inverter |
+| `GET`  | `/device/{device_sn}/info` | Inverter model / rated kW / phase / firmware / image (DB-cached; self-populates once) |
 | `GET`  | `/device/{device_sn}/latest` | Newest stored reading — confirm a trigger landed |
 | `GET`  | `/health` | Liveness + which DB backend + whether protected |
 

@@ -75,6 +75,44 @@ def latest(device_sn: str):
     return rows[0] if rows else None
 
 
+# ---- device model / static info (from baseInverterDetail) ------------------
+def device_info(device_sn: str) -> dict | None:
+    """Stored model info for a device, or None if the device isn't in the catalog."""
+    r = pg.run(
+        "select device_sn, model, rated_power_kw, phase_name, firmware, image_url, "
+        "device_type, plant_uid from saj_device where device_sn=$1",
+        [device_sn],
+    )
+    rows = r.get("rows") or []
+    return rows[0] if rows else None
+
+
+def _upsert_device_info(sn: str, b: dict):
+    """Persist the human-readable model fields from a baseInverterDetail payload."""
+    pg.run(
+        "insert into saj_device (device_sn, model, rated_power_kw, phase_name, "
+        "firmware, image_url, updated_at) values ($1,$2,$3,$4,$5,$6, now()) "
+        "on conflict (device_sn) do update set model=excluded.model, "
+        "rated_power_kw=excluded.rated_power_kw, phase_name=excluded.phase_name, "
+        "firmware=excluded.firmware, image_url=excluded.image_url, updated_at=now()",
+        [sn, b.get("inverterModel"), _f(b.get("ratedPower")), b.get("phaseName"),
+         b.get("displayFw"), b.get("inverterPic")],
+    )
+
+
+def ensure_device_info(client, device_sn: str, force: bool = False) -> dict | None:
+    """Populate model info if missing (or `force`), then return it.
+
+    One SAJ call per device ever: once `model` is stored, later calls short-circuit.
+    """
+    row = device_info(device_sn)
+    if not force and row and row.get("model"):
+        return row
+    b = client.inverter_base(device_sn)
+    _upsert_device_info(device_sn, b)
+    return device_info(device_sn)
+
+
 def fetch_device(client, device_sn: str, days: int = 1,
                  fresh_seconds: int = 0, force: bool = False) -> dict:
     """Pull `days` of 5-min data (today back) for one device SN into saj_reading.
@@ -103,6 +141,12 @@ def fetch_device(client, device_sn: str, days: int = 1,
         rows = client.raw_data_day(device_sn, day)
         total += _upsert_readings(device_sn, rows)
     _last_pull[device_sn] = time.time()
+    # Opportunistically fill model info while we're already talking to SAJ.
+    # Best-effort: model is secondary, so never let it fail the data fetch.
+    try:
+        ensure_device_info(client, device_sn)
+    except Exception as e:  # noqa: BLE001
+        print(f"[device-info] {device_sn} skip: {e}", flush=True)
     return {"rows_written": total, "source": "live", "latest": latest(device_sn)}
 
 

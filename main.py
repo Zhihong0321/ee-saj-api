@@ -155,6 +155,26 @@ def plant_series(plant_uid: str,
             "daily": fetcher.daily_for_sns(sns, days)}
 
 
+@app.get("/device/{device_sn}/info")
+def device_info(device_sn: str):
+    """Inverter model / rated power / phase / firmware / image.
+
+    Served from the DB; if not populated yet, fetched from SAJ once and cached.
+    """
+    row = fetcher.device_info(device_sn)
+    if row and row.get("model"):
+        return row
+    with _lock:
+        client = _get_client()
+        try:
+            info = fetcher.ensure_device_info(client, device_sn, force=True)
+        except SajError as e:
+            raise HTTPException(502, f"SAJ error {e.err_code}: {e.err_msg}")
+    if info is None:
+        raise HTTPException(404, f"device {device_sn} not found")
+    return info
+
+
 @app.get("/device/{device_sn}/latest")
 def device_latest(device_sn: str):
     return {"device_sn": device_sn, "latest": fetcher.latest(device_sn)}
