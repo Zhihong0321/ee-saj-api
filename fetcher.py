@@ -9,9 +9,14 @@ The reader shifts back to Asia/Kuala_Lumpur for display.
 """
 from __future__ import annotations
 
+import time
 import datetime as dt
 
 import pg
+
+# When we last pulled each device from SAJ (in-process; resets on redeploy).
+# Powers the per-visit freshness gate so rapid re-opens don't re-hit the portal.
+_last_pull: dict[str, float] = {}
 
 # saj_reading columns we populate (raw jsonb left null — charts don't need it)
 _COLS = ["device_sn", "ts", "ac_power_w", "pv_power_w", "today_kwh",
@@ -59,33 +64,6 @@ def _upsert_readings(sn: str, rows: list[dict], batch: int = 200) -> int:
     return written
 
 
-def fetch_device(client, device_sn: str, days: int = 1) -> int:
-    """Pull `days` of 5-min data (today back) for one device SN into saj_reading.
-
-    Returns total rows written. `days=1` = today only (the freshness trigger);
-    larger values backfill history in one call.
-    """
-    total = 0
-    today = dt.date.today()
-    for i in range(days):
-        day = (today - dt.timedelta(days=i)).isoformat()
-        rows = client.raw_data_day(device_sn, day)
-        total += _upsert_readings(device_sn, rows)
-    return total
-
-
-def fetch_plant(client, plant_uid: str, days: int = 1) -> dict:
-    """Resolve the plant's device SNs live from the portal, fetch each.
-
-    Returns {device_sn: rows_written}. Works without a synced catalog.
-    """
-    sns = client.plant_device_sns(plant_uid)
-    result = {}
-    for sn in sns:
-        result[sn] = fetch_device(client, sn, days=days)
-    return result
-
-
 def latest(device_sn: str):
     """Newest stored reading for a device — used to confirm a trigger landed."""
     r = pg.run(
@@ -95,3 +73,47 @@ def latest(device_sn: str):
     )
     rows = r.get("rows") or []
     return rows[0] if rows else None
+
+
+def fetch_device(client, device_sn: str, days: int = 1,
+                 fresh_seconds: int = 0, force: bool = False) -> dict:
+    """Pull `days` of 5-min data (today back) for one device SN into saj_reading.
+
+    `days=1` = today only (morning -> now), the per-visit / nightly trigger.
+    Larger values backfill history in one call.
+
+    Freshness gate (per-visit efficiency): when `fresh_seconds` > 0 and `days==1`,
+    if we already pulled this device from SAJ within the last `fresh_seconds`,
+    skip the portal call and serve what's already in the DB — so rapid re-opens
+    of the app don't hammer SAJ (data is only 5-min cadence anyway). `force=True`
+    always pulls. The nightly sweep passes `fresh_seconds=0`, so it always does a
+    full pull.
+
+    Returns {"rows_written": int, "source": "cache"|"live", "latest": row}.
+    """
+    if not force and fresh_seconds and days == 1:
+        last = _last_pull.get(device_sn)
+        if last is not None and (time.time() - last) < fresh_seconds:
+            return {"rows_written": 0, "source": "cache", "latest": latest(device_sn)}
+
+    total = 0
+    today = dt.date.today()
+    for i in range(days):
+        day = (today - dt.timedelta(days=i)).isoformat()
+        rows = client.raw_data_day(device_sn, day)
+        total += _upsert_readings(device_sn, rows)
+    _last_pull[device_sn] = time.time()
+    return {"rows_written": total, "source": "live", "latest": latest(device_sn)}
+
+
+def fetch_plant(client, plant_uid: str, days: int = 1,
+                fresh_seconds: int = 0, force: bool = False) -> dict:
+    """Resolve the plant's device SNs live from the portal, fetch each.
+
+    Returns {device_sn: <fetch_device result>}. Works without a synced catalog.
+    """
+    sns = client.plant_device_sns(plant_uid)
+    return {
+        sn: fetch_device(client, sn, days=days, fresh_seconds=fresh_seconds, force=force)
+        for sn in sns
+    }

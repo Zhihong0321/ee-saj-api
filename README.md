@@ -64,13 +64,31 @@ smoke test) — set it before real use.
    current prod DB; the file is here for a fresh environment.
 4. Deploy. Hit `/health` to confirm `db_backend: database_url`.
 
-### Scheduling (optional)
+## Two operating modes
 
-For automatic freshness, add a **Railway Cron** service (or an external cron / the
-client app) that POSTs `/fetch/device/...` or `/fetch/plant/...` on an interval.
-Recommended: fetch a plant only when a customer is actively viewing it (on-demand),
-plus a nightly full backfill. 5-minute data means polling faster than ~15 min is
-wasted work — and keeps you well under the portal's rate alarm.
+**Daytime — sync per visit (on-demand).** When a customer opens the app, have the
+app POST `/fetch/plant/{uid}` (or `/fetch/device/{sn}`). That pulls today's data
+(this morning → now) into `saj_reading`, then the app reads it back. A freshness
+gate (`VISIT_FRESH_SECONDS`, default 240s) means if the same device was already
+pulled seconds ago, the call serves cache and skips SAJ — so rapid re-opens don't
+hammer the portal (data is only 5-min cadence). Add `?force=true` to override.
+
+**Nightly — full sweep at 23:00 MYT.** `sync_all.py` fetches today's complete
+curve for **every** device (always a full pull, no gate), guaranteeing a gap-free
+day once the sun is down. Set it up as a **Railway Cron**:
+
+1. In the same Railway project, **New → GitHub Repo → same repo** (creates a 2nd
+   service off `ee-saj-api`).
+2. That service's **Settings**:
+   - **Start Command:** `python sync_all.py`
+   - **Cron Schedule:** `0 15 * * *`  → 15:00 UTC = **23:00 Malaysia time**
+3. **Variables:** same `DATABASE_URL`, `SAJ_USER`, `SAJ_PASS` as the web service
+   (Railway "shared variables" or copy them). `TRIGGER_TOKEN` is not needed here.
+
+Railway runs the start command on the schedule; the script sweeps the fleet
+(~1010 devices at ~1 req/s ≈ 20 min), logs progress, and exits. Tunables:
+`SAJ_REQ_INTERVAL` (throttle), `SYNC_DAYS` (days back, default 1), `SYNC_LIMIT`
+(cap for testing).
 
 ## Config (env vars)
 
