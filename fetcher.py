@@ -117,3 +117,53 @@ def fetch_plant(client, plant_uid: str, days: int = 1,
         sn: fetch_device(client, sn, days=days, fresh_seconds=fresh_seconds, force=force)
         for sn in sns
     }
+
+
+# ---- read side: chart-ready series straight from prod (no SAJ call) --------
+def _myt_since(days: int) -> str:
+    """First MYT calendar day to include, for a `days`-window ending today."""
+    myt_today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+    return (myt_today - dt.timedelta(days=days - 1)).isoformat()
+
+
+def plant_sns(plant_uid: str) -> list[str]:
+    """Device SNs for a plant from the catalog (fast, no SAJ call)."""
+    r = pg.run("select device_sn from saj_device where plant_uid=$1 order by device_sn",
+               [plant_uid])
+    return [row["device_sn"] for row in r.get("rows", [])]
+
+
+def series_for_sns(sns: list[str], days: int = 1) -> list[dict]:
+    """AC-power curve (5-min), summed across the given devices. [{ts, ac_power_w}]."""
+    if not sns:
+        return []
+    ph = ",".join(f"${i + 2}" for i in range(len(sns)))
+    sql = (
+        "select r.ts, sum(coalesce(r.ac_power_w,0)) as ac_power_w from saj_reading r "
+        f"where r.device_sn in ({ph}) "
+        "and (r.ts at time zone 'Asia/Kuala_Lumpur')::date >= $1::date "
+        "group by r.ts order by r.ts"
+    )
+    r = pg.run(sql, [_myt_since(days), *sns])
+    return r.get("rows", [])
+
+
+def daily_for_sns(sns: list[str], days: int = 1) -> list[dict]:
+    """Per-day generation (kWh), summed across devices. [{day, kwh}].
+
+    Per device per day = max(today_kwh) (it's cumulative), then summed.
+    """
+    if not sns:
+        return []
+    ph = ",".join(f"${i + 2}" for i in range(len(sns)))
+    sql = (
+        "select day, sum(kwh) as kwh from ("
+        "  select r.device_sn, (r.ts at time zone 'Asia/Kuala_Lumpur')::date as day, "
+        "         max(coalesce(r.today_kwh,0)) as kwh from saj_reading r "
+        f"  where r.device_sn in ({ph}) "
+        "  and (r.ts at time zone 'Asia/Kuala_Lumpur')::date >= $1::date "
+        "  group by r.device_sn, 2"
+        ") t group by day order by day"
+    )
+    r = pg.run(sql, [_myt_since(days), *sns])
+    return r.get("rows", [])

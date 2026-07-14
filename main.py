@@ -81,9 +81,11 @@ def fetch_device(
     device_sn: str,
     days: int = Query(1, ge=1, le=MAX_DAYS, description="days of history back from today"),
     force: bool = Query(False, description="bypass the freshness gate and always pull"),
+    series: bool = Query(True, description="include chart-ready series + daily kWh"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
 ):
+    """Refresh one inverter into prod, then return display-ready data (one call)."""
     _check_auth(token or x_trigger_token)
     with _lock:
         client = _get_client()
@@ -92,7 +94,12 @@ def fetch_device(
                                        fresh_seconds=VISIT_FRESH_SECONDS, force=force)
         except SajError as e:
             raise HTTPException(502, f"SAJ error {e.err_code}: {e.err_msg}")
-    return {"device_sn": device_sn, "days": days, **res}
+    out = {"device_sn": device_sn, "days": days, "rows_written": res["rows_written"],
+           "source": res["source"], "latest": res["latest"]}
+    if series:
+        out["series"] = fetcher.series_for_sns([device_sn], days)
+        out["daily"] = fetcher.daily_for_sns([device_sn], days)
+    return out
 
 
 @app.post("/fetch/plant/{plant_uid}")
@@ -100,9 +107,11 @@ def fetch_plant(
     plant_uid: str,
     days: int = Query(1, ge=1, le=MAX_DAYS, description="days of history back from today"),
     force: bool = Query(False, description="bypass the freshness gate and always pull"),
+    series: bool = Query(True, description="include chart-ready series + daily kWh"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
 ):
+    """Refresh every inverter in a plant, then return the plant's display-ready data."""
     _check_auth(token or x_trigger_token)
     with _lock:
         client = _get_client()
@@ -113,13 +122,37 @@ def fetch_plant(
             raise HTTPException(502, f"SAJ error {e.err_code}: {e.err_msg}")
     if not per_device:
         raise HTTPException(404, f"no devices found for plant {plant_uid}")
-    return {
+    sns = list(per_device.keys())
+    out = {
         "plant_uid": plant_uid,
         "days": days,
-        "device_count": len(per_device),
+        "device_count": len(sns),
         "rows_written": sum(d["rows_written"] for d in per_device.values()),
-        "devices": per_device,
+        "source": "live" if any(d["source"] == "live" for d in per_device.values()) else "cache",
+        "devices": sns,
     }
+    if series:
+        out["series"] = fetcher.series_for_sns(sns, days)
+        out["daily"] = fetcher.daily_for_sns(sns, days)
+    return out
+
+
+# ---- read-only: chart data straight from prod (no SAJ call) ---------------
+@app.get("/device/{device_sn}/series")
+def device_series(device_sn: str,
+                  days: int = Query(1, ge=1, le=MAX_DAYS)):
+    return {"device_sn": device_sn, "days": days,
+            "series": fetcher.series_for_sns([device_sn], days),
+            "daily": fetcher.daily_for_sns([device_sn], days)}
+
+
+@app.get("/plant/{plant_uid}/series")
+def plant_series(plant_uid: str,
+                 days: int = Query(1, ge=1, le=MAX_DAYS)):
+    sns = fetcher.plant_sns(plant_uid)
+    return {"plant_uid": plant_uid, "days": days, "device_count": len(sns),
+            "series": fetcher.series_for_sns(sns, days),
+            "daily": fetcher.daily_for_sns(sns, days)}
 
 
 @app.get("/device/{device_sn}/latest")
