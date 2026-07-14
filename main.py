@@ -32,6 +32,7 @@ from fastapi import FastAPI, HTTPException, Header, Query
 
 import fetcher
 import pg
+import r2
 from saj_api import SajClient, SajError
 
 SAJ_USER = os.environ.get("SAJ_USER")
@@ -72,6 +73,7 @@ def health():
         "saj_account": SAJ_USER,
         "protected": bool(TRIGGER_TOKEN),
         "visit_fresh_seconds": VISIT_FRESH_SECONDS,
+        "r2_image_mirror": r2.enabled(),
         "time": dt.datetime.utcnow().isoformat() + "Z",
     }
 
