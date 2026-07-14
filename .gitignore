@@ -1,0 +1,17 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+.pg_token
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# local data
+*.db
+*.sqlite
+*.har
