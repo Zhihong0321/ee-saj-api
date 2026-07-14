@@ -39,11 +39,13 @@ SAJ_USER = os.environ.get("SAJ_USER")
 SAJ_PASS = os.environ.get("SAJ_PASS")
 TRIGGER_TOKEN = os.environ.get("TRIGGER_TOKEN")
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "14"))
+# Wide window for the on-demand monthly backfill + reads (app-chosen, heavier).
+HISTORY_MAX_DAYS = int(os.environ.get("HISTORY_MAX_DAYS", "31"))
 # per-visit gate: skip the SAJ pull if today's newest stored reading is younger
 # than this (data is 5-min cadence, so ~4 min avoids redundant pulls on refresh).
 VISIT_FRESH_SECONDS = int(os.environ.get("VISIT_FRESH_SECONDS", "240"))
 
-app = FastAPI(title="EE SAJ Data Fetcher", version="1.1.0")
+app = FastAPI(title="EE SAJ Data Fetcher", version="1.2.0")
 
 _lock = threading.Lock()
 _client: SajClient | None = None
@@ -139,10 +141,82 @@ def fetch_plant(
     return out
 
 
+# ---- wide window: on-demand 31-day (monthly) backfill ---------------------
+# Separate from the fast 7-day path on purpose. Skip-aware: the first call
+# backfills the whole window from SAJ; repeat calls only re-pull today, so it's
+# cheap to call again. The app decides when a 30/31-day view is actually needed.
+@app.post("/fetch/device/{device_sn}/last31")
+def fetch_device_last31(
+    device_sn: str,
+    days: int = Query(31, ge=8, le=HISTORY_MAX_DAYS,
+                      description="days of history back from today (wide window)"),
+    force: bool = Query(False, description="re-pull every day, even already-stored past days"),
+    series: bool = Query(True, description="include chart-ready series + daily kWh"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    """Backfill up to `days` (default 31) for one inverter, then return the window."""
+    _check_auth(token or x_trigger_token)
+    with _lock:
+        client = _get_client()
+        try:
+            res = fetcher.fetch_device_history(client, device_sn, days=days, force=force)
+        except SajError as e:
+            raise HTTPException(502, f"SAJ error {e.err_code}: {e.err_msg}")
+    out = {"device_sn": device_sn, "days": days,
+           "rows_written": res["rows_written"], "days_pulled": res["days_pulled"],
+           "days_skipped": res["days_skipped"], "latest": res["latest"]}
+    if series:
+        out["series"] = fetcher.series_for_sns([device_sn], days)
+        out["daily"] = fetcher.daily_for_sns([device_sn], days)
+    return out
+
+
+@app.post("/fetch/plant/{plant_uid}/last31")
+def fetch_plant_last31(
+    plant_uid: str,
+    days: int = Query(31, ge=8, le=HISTORY_MAX_DAYS,
+                      description="days of history back from today (wide window)"),
+    force: bool = Query(False, description="re-pull every day, even already-stored past days"),
+    series: bool = Query(True, description="include chart-ready series + daily kWh"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    """Backfill up to `days` (default 31) for every inverter in a plant, then return it.
+
+    NOTE: a cold first call pulls one SAJ request per missing day per device and runs
+    synchronously — expect several seconds to ~a minute for a multi-inverter plant.
+    Subsequent calls are fast (only today is re-pulled).
+    """
+    _check_auth(token or x_trigger_token)
+    with _lock:
+        client = _get_client()
+        try:
+            per_device = fetcher.fetch_plant_history(client, plant_uid, days=days, force=force)
+        except SajError as e:
+            raise HTTPException(502, f"SAJ error {e.err_code}: {e.err_msg}")
+    if not per_device:
+        raise HTTPException(404, f"no devices found for plant {plant_uid}")
+    sns = list(per_device.keys())
+    out = {
+        "plant_uid": plant_uid,
+        "days": days,
+        "device_count": len(sns),
+        "rows_written": sum(d["rows_written"] for d in per_device.values()),
+        "days_pulled": sum(d["days_pulled"] for d in per_device.values()),
+        "days_skipped": sum(d["days_skipped"] for d in per_device.values()),
+        "devices": sns,
+    }
+    if series:
+        out["series"] = fetcher.series_for_sns(sns, days)
+        out["daily"] = fetcher.daily_for_sns(sns, days)
+    return out
+
+
 # ---- read-only: chart data straight from prod (no SAJ call) ---------------
 @app.get("/device/{device_sn}/series")
 def device_series(device_sn: str,
-                  days: int = Query(1, ge=1, le=MAX_DAYS)):
+                  days: int = Query(1, ge=1, le=HISTORY_MAX_DAYS)):
     return {"device_sn": device_sn, "days": days,
             "series": fetcher.series_for_sns([device_sn], days),
             "daily": fetcher.daily_for_sns([device_sn], days)}
@@ -150,7 +224,7 @@ def device_series(device_sn: str,
 
 @app.get("/plant/{plant_uid}/series")
 def plant_series(plant_uid: str,
-                 days: int = Query(1, ge=1, le=MAX_DAYS)):
+                 days: int = Query(1, ge=1, le=HISTORY_MAX_DAYS)):
     sns = fetcher.plant_sns(plant_uid)
     return {"plant_uid": plant_uid, "days": days, "device_count": len(sns),
             "series": fetcher.series_for_sns(sns, days),

@@ -170,6 +170,63 @@ def fetch_plant(client, plant_uid: str, days: int = 1,
     }
 
 
+# ---- historical backfill: skip-aware, for the wide (e.g. 31-day) window ----
+def _day_has_rows(device_sn: str, day: str) -> bool:
+    """True if `saj_reading` already holds any row for this device on this MYT day."""
+    r = pg.run(
+        "select 1 from saj_reading where device_sn=$1 "
+        "and (ts at time zone 'Asia/Kuala_Lumpur')::date = $2::date limit 1",
+        [device_sn, day],
+    )
+    return bool(r.get("rows"))
+
+
+def fetch_device_history(client, device_sn: str, days: int = 31,
+                         force: bool = False) -> dict:
+    """Backfill up to `days` of history for one device, cheaply.
+
+    Past days are immutable once stored, so any past MYT day that already has rows
+    is skipped — only genuinely missing history is pulled from SAJ. Today (i==0) is
+    always re-pulled since it's still accumulating. `force=True` re-pulls every day.
+
+    Unlike `fetch_device`, this is meant for the wide monthly window the app calls
+    on demand: the first call backfills the month; later calls only touch today.
+
+    Returns {"rows_written", "days_pulled", "days_skipped", "latest"}.
+    """
+    total = pulled = skipped = 0
+    today = dt.date.today()
+    for i in range(days):
+        day = (today - dt.timedelta(days=i)).isoformat()
+        if i != 0 and not force and _day_has_rows(device_sn, day):
+            skipped += 1
+            continue
+        rows = client.raw_data_day(device_sn, day)
+        total += _upsert_readings(device_sn, rows)
+        pulled += 1
+    _last_pull[device_sn] = time.time()
+    # Opportunistically fill model info while we're already talking to SAJ.
+    try:
+        ensure_device_info(client, device_sn)
+    except Exception as e:  # noqa: BLE001
+        print(f"[device-info] {device_sn} skip: {e}", flush=True)
+    return {"rows_written": total, "days_pulled": pulled,
+            "days_skipped": skipped, "latest": latest(device_sn)}
+
+
+def fetch_plant_history(client, plant_uid: str, days: int = 31,
+                        force: bool = False) -> dict:
+    """Skip-aware historical backfill for every device in a plant.
+
+    Returns {device_sn: <fetch_device_history result>}.
+    """
+    sns = client.plant_device_sns(plant_uid)
+    return {
+        sn: fetch_device_history(client, sn, days=days, force=force)
+        for sn in sns
+    }
+
+
 # ---- read side: chart-ready series straight from prod (no SAJ call) --------
 def _myt_since(days: int) -> str:
     """First MYT calendar day to include, for a `days`-window ending today."""
