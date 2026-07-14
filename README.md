@@ -9,19 +9,26 @@ You trigger a fetch by **device serial** or **plant UID**; the service logs into
 the SAJ portal (auto-relogin on token expiry), pulls the raw 5-min rows, and
 upserts them into Postgres.
 
+**Live:** https://ee-saj-api-production.up.railway.app · interactive docs at
+[`/docs`](https://ee-saj-api-production.up.railway.app/docs).
+
 ## Endpoints
 
 | Method | Path | What it does |
 |---|---|---|
-| `POST` | `/fetch/device/{device_sn}?days=1` | Fetch one inverter's last `days` days into `saj_reading` |
-| `POST` | `/fetch/plant/{plant_uid}?days=1` | Resolve the plant's inverters (live) and fetch each |
+| `POST` | `/fetch/plant/{plant_uid}?days=1` | **Main app call** — refresh the plant into prod, return chart-ready `series` + `daily` |
+| `POST` | `/fetch/device/{device_sn}?days=1` | Same for one inverter serial (adds `latest`) |
+| `GET`  | `/plant/{plant_uid}/series?days=1` | Chart data straight from prod — no SAJ call, no token |
+| `GET`  | `/device/{device_sn}/series?days=1` | Same, one inverter |
 | `GET`  | `/device/{device_sn}/latest` | Newest stored reading — confirm a trigger landed |
 | `GET`  | `/health` | Liveness + which DB backend + whether protected |
 
-`days=1` = today only (the freshness trigger). Larger `days` backfills history in
-one shot (capped by `MAX_DAYS`, default 14).
+`days=1` = today only (the per-visit trigger). Larger `days` backfills history in
+one shot (capped by `MAX_DAYS`). `/fetch/*` require the `X-Trigger-Token` header;
+`?series=false` skips the chart payload; `?force=true` bypasses the freshness gate.
 
-Interactive docs at `/docs` once deployed.
+**Response shape** (`/fetch/plant` and `/series`): `series` = `[{ts, ac_power_w}]`
+(ts is UTC — display +8h as Asia/Kuala_Lumpur), `daily` = `[{day, kwh}]`.
 
 ### Trigger examples
 
