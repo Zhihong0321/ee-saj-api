@@ -13,6 +13,7 @@ import time
 import datetime as dt
 
 import pg
+import r2
 
 # When we last pulled each device from SAJ (in-process; resets on redeploy).
 # Powers the per-visit freshness gate so rapid re-opens don't re-hit the portal.
@@ -88,7 +89,13 @@ def device_info(device_sn: str) -> dict | None:
 
 
 def _upsert_device_info(sn: str, b: dict):
-    """Persist the human-readable model fields from a baseInverterDetail payload."""
+    """Persist the human-readable model fields from a baseInverterDetail payload.
+
+    Mirrors the model image into our R2 bucket and stores OUR URL; if R2 is
+    unconfigured or the mirror fails, falls back to the original SAJ-cloud URL.
+    """
+    saj_pic = b.get("inverterPic")
+    image_url = r2.mirror_image(saj_pic) or saj_pic
     pg.run(
         "insert into saj_device (device_sn, model, rated_power_kw, phase_name, "
         "firmware, image_url, updated_at) values ($1,$2,$3,$4,$5,$6, now()) "
@@ -96,7 +103,7 @@ def _upsert_device_info(sn: str, b: dict):
         "rated_power_kw=excluded.rated_power_kw, phase_name=excluded.phase_name, "
         "firmware=excluded.firmware, image_url=excluded.image_url, updated_at=now()",
         [sn, b.get("inverterModel"), _f(b.get("ratedPower")), b.get("phaseName"),
-         b.get("displayFw"), b.get("inverterPic")],
+         b.get("displayFw"), image_url],
     )
 
 
