@@ -1,0 +1,17 @@
+name: Nightly SAJ fleet sync
+
+on:
+  schedule:
+    # 15:00 UTC = 23:00 MYT
+    - cron: '0 15 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Kick off /sync/all (fire-and-forget, runs in background on the server)
+        run: |
+          curl -sS -X POST "https://ee-saj-api-production.up.railway.app/sync/all" \
+            --data-urlencode "token=${{ secrets.SYNC_TRIGGER_TOKEN }}" \
+            -G --fail-with-body

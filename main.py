@@ -25,6 +25,8 @@ shared client + lock.
 from __future__ import annotations
 
 import os
+import time
+import random
 import threading
 import datetime as dt
 
@@ -254,3 +256,79 @@ def device_info(device_sn: str):
 @app.get("/device/{device_sn}/latest")
 def device_latest(device_sn: str):
     return {"device_sn": device_sn, "latest": fetcher.latest(device_sn)}
+
+
+# ---- nightly full-fleet sync, triggered over HTTP by an external cron -----
+# No Railway Cron service needed: this web service is already always-on, so a
+# free external pinger (GitHub Actions schedule, cron-job.org, etc.) hitting
+# this endpoint once a night is enough. Runs in a background thread and
+# returns immediately — a full sweep takes minutes, longer than most free
+# cron pingers wait for a response.
+_sync_lock = threading.Lock()
+_sync_state = {
+    "running": False, "started_at": None, "finished_at": None,
+    "total": 0, "done": 0, "ok": 0, "err": 0, "rows": 0, "last_error": None,
+}
+
+
+def _sync_all_worker(days: int, limit: int | None):
+    interval = float(os.environ.get("SAJ_REQ_INTERVAL", "1.0"))
+    jitter = float(os.environ.get("SAJ_REQ_JITTER", "0.3"))
+    try:
+        client = _get_client()
+        r = pg.run("select device_sn from saj_device order by device_sn")
+        sns = [row["device_sn"] for row in r.get("rows", [])]
+        if not sns:
+            sns = [sn for _, _, sn in client.iter_all_devices()]
+        if limit:
+            sns = sns[:limit]
+        _sync_state["total"] = len(sns)
+        print(f"[sync-all] devices={len(sns)} days={days} interval={interval}s", flush=True)
+        for sn in sns:
+            try:
+                with _lock:
+                    res = fetcher.fetch_device(client, sn, days=days)  # no gate -> full pull
+                _sync_state["rows"] += res["rows_written"]
+                _sync_state["ok"] += 1
+            except Exception as e:  # noqa: BLE001 — keep the sweep alive
+                _sync_state["err"] += 1
+                _sync_state["last_error"] = f"{sn}: {e}"
+                print(f"[sync-all] {sn} FAIL {e}", flush=True)
+            _sync_state["done"] += 1
+            time.sleep(interval + random.uniform(0, jitter))
+        print(f"[sync-all] DONE ok={_sync_state['ok']} err={_sync_state['err']} "
+              f"rows={_sync_state['rows']}", flush=True)
+    except Exception as e:  # noqa: BLE001 — never let the thread die silently
+        _sync_state["last_error"] = f"fatal: {e}"
+        print(f"[sync-all] FATAL {e}", flush=True)
+    finally:
+        _sync_state["running"] = False
+        _sync_state["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
+
+
+@app.post("/sync/all")
+def sync_all(
+    days: int = Query(1, ge=1, le=MAX_DAYS, description="days back to pull per device"),
+    limit: int | None = Query(None, description="cap device count (testing)"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    """Kick off a full-fleet sweep in the background; returns immediately.
+
+    Meant to be called once nightly by an external cron (no Railway Cron
+    service needed). Refuses to start a second sweep while one is running.
+    """
+    _check_auth(token or x_trigger_token)
+    with _sync_lock:
+        if _sync_state["running"]:
+            return {"status": "already_running", **_sync_state}
+        _sync_state.update(running=True, started_at=dt.datetime.utcnow().isoformat() + "Z",
+                           finished_at=None, total=0, done=0, ok=0, err=0, rows=0,
+                           last_error=None)
+        threading.Thread(target=_sync_all_worker, args=(days, limit), daemon=True).start()
+    return {"status": "started", **_sync_state}
+
+
+@app.get("/sync/status")
+def sync_status():
+    return _sync_state
