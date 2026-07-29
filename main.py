@@ -31,10 +31,13 @@ import threading
 import datetime as dt
 
 from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.responses import HTMLResponse
 
 import fetcher
 import pg
 import r2
+import backfill
+from backfill_page import PAGE as BACKFILL_PAGE
 from saj_api import SajClient, SajError
 
 SAJ_USER = os.environ.get("SAJ_USER")
@@ -332,3 +335,54 @@ def sync_all(
 @app.get("/sync/status")
 def sync_status():
     return _sync_state
+
+
+# ---- one-time historical copy: browser-driven, resumable ------------------
+# The full history is ~240k SAJ calls (one device-day per call — the portal
+# clamps multi-day ranges and rejects multi-device), so it runs as a background
+# worker pool with its progress in Postgres, driven from /backfill.
+@app.get("/backfill", response_class=HTMLResponse)
+def backfill_page():
+    return HTMLResponse(BACKFILL_PAGE)
+
+
+@app.post("/backfill/start")
+def backfill_start(
+    window_start: str | None = Query(None, description="oldest day to copy (YYYY-MM-DD)"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    _check_auth(token or x_trigger_token)
+    try:
+        return backfill.start(window_start)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, str(e))
+
+
+@app.post("/backfill/stop")
+def backfill_stop(
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    _check_auth(token or x_trigger_token)
+    return backfill.stop()
+
+
+@app.get("/backfill/status")
+def backfill_status():
+    return backfill.status()
+
+
+@app.get("/backfill/errors")
+def backfill_errors(limit: int = Query(10, ge=1, le=100)):
+    try:
+        return backfill.recent_errors(limit)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@app.on_event("startup")
+def _resume_backfill():
+    """A job still marked 'running' means the process was killed mid-copy
+    (redeploy/crash) — pick it back up automatically."""
+    backfill.resume_if_interrupted()
