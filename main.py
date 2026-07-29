@@ -6,6 +6,7 @@ Trigger a fetch of the 5-min generation feed from the SAJ portal into prod
     POST /fetch/device/{device_sn}?days=1[&force=true]   one inverter
     POST /fetch/plant/{plant_uid}?days=1[&force=true]     every inverter in a plant
     GET  /device/{device_sn}/latest                       confirm what landed
+    GET  /backfill                                        one-time history copy UI
     GET  /health                                          liveness + config
 
 Two intended use modes:
@@ -15,6 +16,10 @@ Two intended use modes:
     data is already fresh, so rapid re-opens don't hammer the portal.
   * Nightly 23:00 MYT: a Railway Cron runs sync_all.py -> full sweep of every
     device for the complete day (always a full pull, no gate).
+
+Separate from both: /backfill is the one-time copy of all retained history
+(see backfill.py) — a worker pool with its progress in Postgres, started and
+stopped from a page in the browser and resumable across redeploys.
 
 Auth: if TRIGGER_TOKEN is set, every /fetch call must present it as `?token=...`
 or header `X-Trigger-Token: ...`.
