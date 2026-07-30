@@ -53,8 +53,9 @@ PAGE = """<!doctype html>
 <body>
 <div class="wrap">
   <h1>SAJ historical copy</h1>
-  <div class="sub">One-time backfill of the 5-min feed into <span class="mono">saj_reading</span>.
-    Stop any time &mdash; Start resumes where it left off.</div>
+  <div class="sub">Backfill of the 5-min feed into <span class="mono">saj_reading</span>.
+    Stop any time &mdash; Start resumes where it left off.
+    <span id="policy"></span></div>
 
   <div class="card">
     <div class="row">
@@ -126,6 +127,9 @@ async function poll(){
   const el = $('state'); el.textContent = st; el.className = 'state s'+'-'+st;
   $('window').textContent = s.window_start ? s.window_start+' \\u2192 '+s.window_end
                                            + '  ('+s.span_days+'d)' : '';
+  $('policy').textContent = s.policy_months
+    ? 'Policy: last '+s.policy_months+' months only \\u2014 nothing before '
+      +s.policy_floor+' is captured.' : '';
   $('fill').style.width = (s.pct||0)+'%';
   $('pct').textContent = (s.pct||0)+'%';
   $('dev').textContent = nf(s.devices_done)+' / '+nf(s.devices);

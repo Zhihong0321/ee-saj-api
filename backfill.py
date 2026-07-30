@@ -20,16 +20,22 @@ Devices are claimed one at a time with FOR UPDATE SKIP LOCKED, so workers never
 collide and a worker that dies mid-device releases its claim after
 CLAIM_TTL_MIN and someone else picks it up.
 
+Retention policy: we keep at most BACKFILL_MONTHS (default 4) months of
+history. The floor is recomputed from today on every Start, so it is a rolling
+window, and it is enforced as a clamp — an explicit `window_start` older than
+the policy is pulled forward, never honoured.
+
 Env:
   BACKFILL_USERS          comma-separated SAJ accounts (default operation02,03,04)
   BACKFILL_PASS           password for those accounts (default SAJ_PASS)
-  BACKFILL_START          oldest day to copy (default 2025-12-01, the retention wall)
+  BACKFILL_MONTHS         how many months of history to keep (default 4)
   BACKFILL_REQ_INTERVAL   extra sleep between calls per worker (default 0.05s)
 """
 from __future__ import annotations
 
 import os
 import time
+import calendar
 import threading
 import datetime as dt
 
@@ -37,9 +43,12 @@ import pg
 import fetcher
 from saj_api import SajClient
 
-# SAJ stops serving 5-min raw data before this date (measured: identical wall on
-# every device tested, including 3-year-old inverters).
-DEFAULT_START = os.environ.get("BACKFILL_START", "2025-12-01")
+# Capture policy: keep this many months of history, and no more. Rolling —
+# recomputed from today at every Start, not a fixed date.
+# (For reference, SAJ itself stops serving 5-min raw data before ~2025-12-01:
+# an identical wall on every device tested, including 3-year-old inverters. So
+# anything beyond ~8 months is unavailable regardless of this policy.)
+POLICY_MONTHS = int(os.environ.get("BACKFILL_MONTHS", "4"))
 USERS = [u.strip() for u in
          os.environ.get("BACKFILL_USERS", "operation02,operation03,operation04").split(",")
          if u.strip()]
@@ -119,10 +128,26 @@ def _set_state(state: str, **cols):
     _db(f"update saj_backfill_job set {','.join(sets)} where id=1", params)
 
 
+def _myt_today() -> dt.date:
+    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+
+
 def _window_end() -> dt.date:
     """Yesterday in MYT — today is still accumulating and belongs to the nightly job."""
-    myt_today = (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
-    return myt_today - dt.timedelta(days=1)
+    return _myt_today() - dt.timedelta(days=1)
+
+
+def _months_ago(d: dt.date, months: int) -> dt.date:
+    m, y = d.month - months, d.year
+    while m <= 0:
+        m += 12
+        y -= 1
+    return dt.date(y, m, min(d.day, calendar.monthrange(y, m)[1]))
+
+
+def policy_floor() -> dt.date:
+    """Oldest day we are allowed to capture, as of now."""
+    return _months_ago(_myt_today(), POLICY_MONTHS)
 
 
 # ---- SAJ paging (correct: pages on `total`) --------------------------------
@@ -278,10 +303,14 @@ def start(window_start: str | None = None) -> dict:
         return {"status": "already_running", **status()}
 
     prev_ws = _as_date(j["window_start"]) if j else None
-    if window_start:
-        ws = dt.date.fromisoformat(window_start)
-    else:
-        ws = prev_ws or dt.date.fromisoformat(DEFAULT_START)
+    floor = policy_floor()
+    requested = (dt.date.fromisoformat(window_start) if window_start
+                 else (prev_ws or floor))
+    # The policy is a clamp, not a default: an older request is pulled forward.
+    ws = max(requested, floor)
+    if requested < floor:
+        print(f"[backfill] {requested} is older than the {POLICY_MONTHS}-month "
+              f"policy; clamped to {floor}", flush=True)
     we = _window_end()
     _seed_devices()
 
@@ -293,6 +322,13 @@ def start(window_start: str | None = None) -> dict:
             "claimed_by=null, claimed_at=null, updated_at=now()")
         print(f"[backfill] window widened {prev_ws} -> {ws}; re-opened all devices",
               flush=True)
+
+    # Days pass between runs, so a device that finished against an older
+    # window_end is no longer actually complete. Re-open those; the per-device
+    # skip of days already stored keeps this cheap.
+    _db("update saj_backfill_device set done=false, claimed_by=null, claimed_at=null, "
+        "updated_at=now() where done and (cursor_day is null or cursor_day <= $1::date)",
+        [we.isoformat()])
     if j:
         _db("update saj_backfill_job set state='running', window_start=$1, window_end=$2, "
             "workers=$3, started_at=coalesce(started_at, now()), stopped_at=null, "
@@ -386,6 +422,8 @@ def status() -> dict:
         "device_days_total": total_days,
         "pct": round(100.0 * days_done / total_days, 2) if total_days else 0.0,
         "rows_written": int(a.get("rows_written") or 0),
+        "policy_months": POLICY_MONTHS,
+        "policy_floor": policy_floor().isoformat(),
         "workers_configured": len(USERS),
         "workers_alive": sum(1 for t in _threads if t.is_alive()),
         "worker_now": dict(_worker_now),
