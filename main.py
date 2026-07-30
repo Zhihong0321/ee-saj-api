@@ -42,6 +42,7 @@ import fetcher
 import pg
 import r2
 import backfill
+import retention
 from backfill_page import PAGE as BACKFILL_PAGE
 from saj_api import SajClient, SajError
 
@@ -306,6 +307,12 @@ def _sync_all_worker(days: int, limit: int | None):
             time.sleep(interval + random.uniform(0, jitter))
         print(f"[sync-all] DONE ok={_sync_state['ok']} err={_sync_state['err']} "
               f"rows={_sync_state['rows']}", flush=True)
+        # Nightly housekeeping: roll the day up and drop 5-min rows that have
+        # aged out of the capture policy, so the table stops growing forever.
+        try:
+            print(f"[sync-all] retention: {retention.enforce()}", flush=True)
+        except Exception as e:  # noqa: BLE001 — never fail the sweep over cleanup
+            print(f"[sync-all] retention FAILED {e}", flush=True)
     except Exception as e:  # noqa: BLE001 — never let the thread die silently
         _sync_state["last_error"] = f"fatal: {e}"
         print(f"[sync-all] FATAL {e}", flush=True)
@@ -384,6 +391,52 @@ def backfill_errors(limit: int = Query(10, ge=1, le=100)):
         return backfill.recent_errors(limit)
     except Exception:  # noqa: BLE001
         return []
+
+
+# ---- retention: daily rollup + prune of the 5-min feed --------------------
+_ret_lock = threading.Lock()
+_ret_state = {"running": False, "started_at": None, "finished_at": None,
+              "result": None, "last_error": None}
+
+
+def _retention_worker(rollup_recent_days: int, dry_run: bool):
+    try:
+        _ret_state["result"] = retention.enforce(rollup_recent_days, dry_run)
+        print(f"[retention] {_ret_state['result']}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        _ret_state["last_error"] = str(e)
+        print(f"[retention] FAILED {e}", flush=True)
+    finally:
+        _ret_state["running"] = False
+        _ret_state["finished_at"] = dt.datetime.utcnow().isoformat() + "Z"
+
+
+@app.post("/maintenance/retention")
+def maintenance_retention(
+    dry_run: bool = Query(False, description="report what would happen, delete nothing"),
+    rollup_recent_days: int = Query(10, ge=1, le=120),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    """Roll every device-day up into saj_daily_energy, then delete 5-min rows
+    older than the capture policy. Returns immediately; poll the GET below."""
+    _check_auth(token or x_trigger_token)
+    with _ret_lock:
+        if _ret_state["running"]:
+            return {"status": "already_running", **_ret_state}
+        _ret_state.update(running=True, started_at=dt.datetime.utcnow().isoformat() + "Z",
+                          finished_at=None, result=None, last_error=None)
+        threading.Thread(target=_retention_worker,
+                         args=(rollup_recent_days, dry_run), daemon=True).start()
+    return {"status": "started", **_ret_state}
+
+
+@app.get("/maintenance/retention")
+def maintenance_retention_status():
+    try:
+        return {**_ret_state, "stats": retention.stats()}
+    except Exception as e:  # noqa: BLE001
+        return {**_ret_state, "stats_error": str(e)}
 
 
 @app.on_event("startup")
