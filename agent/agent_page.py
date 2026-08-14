@@ -133,6 +133,17 @@ function md(text){
   return out.join('');
 }
 
+// FastAPI sends `detail` as a string for HTTPException but as an array of
+// objects for validation errors — String() on that gives "[object Object]".
+function errText(body, r, raw){
+  const d = body && body.detail;
+  if (typeof d === 'string') return `${d} (HTTP ${r.status})`;
+  if (Array.isArray(d)) return d.map(x => x.msg || JSON.stringify(x)).join('; ')
+                               + ` (HTTP ${r.status})`;
+  if (d) return JSON.stringify(d) + ` (HTTP ${r.status})`;
+  return `HTTP ${r.status}: ${(raw || '').slice(0, 200) || 'no response body'}`;
+}
+
 function bubble(who, cls){
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
@@ -160,8 +171,11 @@ async function ask(){
     const url = '/agent/ask?q=' + encodeURIComponent(text)
               + (session ? '&session=' + encodeURIComponent(session) : '');
     const r = await fetch(url, {method:'POST', headers:{'X-Trigger-Token': tok.value}});
-    const body = await r.json();
-    if (!r.ok) throw new Error(body.detail || r.status);
+    const raw = await r.text();
+    let body = null;
+    try { body = JSON.parse(raw); } catch (_) {}
+    if (!r.ok) throw new Error(errText(body, r, raw));
+    if (!body) throw new Error('server sent a non-JSON reply: ' + raw.slice(0, 200));
     session = body.session_id;
     spent += body.cost_usd;
     const secs = ((Date.now()-t0)/1000).toFixed(0);

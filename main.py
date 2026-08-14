@@ -455,7 +455,7 @@ def agent_page():
 
 @app.post("/agent/ask")
 async def agent_ask(
-    q: str = Query(..., min_length=3, description="question about the fleet, in English"),
+    q: str = Query(..., min_length=1, description="question about the fleet, in English"),
     session: str | None = Query(None, description="session_id from a previous turn"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
