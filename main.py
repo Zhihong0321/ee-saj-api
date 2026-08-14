@@ -453,6 +453,17 @@ def agent_page():
     return PAGE
 
 
+@app.get("/agent/data-requests")
+def agent_data_requests():
+    """What the agent has asked us to start syncing from SAJ. The file is on the
+    container's disk, so a redeploy wipes it unless DATA_REQUEST_PATH points at
+    a mounted volume — read it before you redeploy."""
+    from agent import ops_agent
+    reqs = ops_agent.data_requests()
+    return {"count": len(reqs), "path": ops_agent.DATA_REQUEST_PATH,
+            "requests": reqs}
+
+
 @app.post("/agent/ask")
 async def agent_ask(
     q: str = Query(..., min_length=1, description="question about the fleet, in English"),

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import datetime as dt
 import json
 import os
 import sys
@@ -30,6 +31,11 @@ from claude_agent_sdk import (
 # Whatever ANTHROPIC_BASE_URL points at has to actually serve this model.
 MODEL = os.environ.get("AGENT_MODEL", "claude-opus-5")
 MAX_ROWS = 200
+
+# Where the agent parks "we need this from SAJ but don't sync it" notes.
+# NOTE: Railway's filesystem is ephemeral — this file is wiped on every
+# redeploy unless DATA_REQUEST_PATH points at a mounted volume.
+DATA_REQUEST_PATH = os.environ.get("DATA_REQUEST_PATH", "data_request.json")
 
 SCHEMA = """
 saj_device(device_sn PK, plant_uid, alias, model, rated_power_kw, phase_name,
@@ -67,6 +73,37 @@ Rules that matter:
   ones worth knowing about. If you do split them out, give the total first.
 - saj_reading is 15M rows. Always bound queries by device_sn and/or a ts range.
 
+WHAT YOU ARE ACTUALLY READING
+Every number you give comes from OUR Postgres mirror of the fleet — never from
+the SAJ portal live. You have no connection to SAJ. If the mirror is stale or
+incomplete, your answer is stale or incomplete; say so rather than presenting it
+as the current state of the hardware.
+
+CHECK FRESHNESS BEFORE ANY ANALYSIS
+Readings arrive on a ~5-minute cadence, and a nightly sweep completes the day at
+23:00 MYT. Before analysis work, check `select max(ts) from saj_reading`, and for
+a specific device or day check that the rows you need are actually there.
+If the data is behind — the newest reading is hours old during daylight, or the
+day you were asked about has gaps or missing devices — still give the answer the
+stored data supports, then say plainly that it is based on incomplete data and
+tell them to sync first:
+  - one plant, today .... POST /fetch/plant/{{plant_uid}}?days=1
+  - one device, today ... POST /fetch/device/{{device_sn}}?days=1
+  - whole fleet, today .. POST /sync/all
+  - historical days ..... the /backfill page
+Never silently report a partial day as if it were complete.
+
+DATA WE DO NOT SYNC
+saj_reading carries only ac_power_w, pv_power_w, today/month/year/total kwh and
+device_temp. SAJ's raw feed has ~329 fields per row, so most of it is not here.
+Not stored, and therefore NOT answerable from our DB: per-string DC (pv1..pv6
+voltage / current / power, per-string currents), per-phase grid voltage, current
+and frequency, inverter internal channel temperatures, module signal strength,
+power factor, battery data, and any alarm or fault records.
+If a technician needs one of those for O&M, do not guess, approximate, or infer
+it from what we do have. Call `request_data` with what is needed and why, then
+tell them it has been logged for review. One call per distinct field.
+
 Answer with the actual numbers and device serials. Lead with the answer, then
 the supporting detail. Do not describe the SQL you ran unless asked.
 """
@@ -92,11 +129,45 @@ async def sql(args):
                          "text": json.dumps(rows[:MAX_ROWS], default=str)}]}
 
 
+@tool("request_data",
+      "Log a request for SAJ data we do not currently sync into our DB. Use when "
+      "a technician needs a field for O&M that saj_reading does not carry.",
+      {"needed": str, "reason": str, "devices": str})
+async def request_data(args):
+    entry = {
+        "requested_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
+        "needed": args["needed"],
+        "reason": args["reason"],
+        "devices": args.get("devices", ""),
+    }
+    try:
+        with open(DATA_REQUEST_PATH, encoding="utf-8") as f:
+            reqs = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        reqs = []
+    reqs.append(entry)
+    with open(DATA_REQUEST_PATH, "w", encoding="utf-8") as f:
+        json.dump(reqs, f, indent=2, ensure_ascii=False)
+    print(f"  [request_data] {entry['needed'][:80]}", flush=True)
+    return {"content": [{"type": "text",
+                         "text": f"Logged as request #{len(reqs)} in {DATA_REQUEST_PATH}."}]}
+
+
+def data_requests() -> list:
+    """Everything the agent has asked us to start syncing."""
+    try:
+        with open(DATA_REQUEST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 # Per-request, not global: two browser tabs chatting at once would otherwise
 # each see the other's SQL.
 SQL_LOG: contextvars.ContextVar[list[str]] = contextvars.ContextVar("sql_log")
 
-_server = create_sdk_mcp_server(name="saj", version="0.1.0", tools=[sql])
+_server = create_sdk_mcp_server(name="saj", version="0.1.0",
+                                tools=[sql, request_data])
 
 
 async def ask(question: str, resume: str | None = None) -> dict:
@@ -109,7 +180,7 @@ async def ask(question: str, resume: str | None = None) -> dict:
         mcp_servers={"saj": _server},
         # Allowlist only — no bypassPermissions. The bundled CLI refuses that
         # flag when running as root, which is exactly how Railway starts us.
-        allowed_tools=["mcp__saj__sql"],
+        allowed_tools=["mcp__saj__sql", "mcp__saj__request_data"],
         # This endpoint is internet-facing. The allowlist already gates them,
         # but name the dangerous built-ins explicitly so a future options change
         # can't quietly hand a public chat box a shell.
