@@ -447,9 +447,16 @@ def maintenance_retention_status():
 # Natural-language questions about the fleet, answered by a Claude Agent SDK
 # agent whose only tool is a read-only SELECT against the saj_* tables.
 # Imported lazily so a missing claude-agent-sdk can never take down the fetcher.
+@app.get("/agent", response_class=HTMLResponse)
+def agent_page():
+    from agent.agent_page import PAGE
+    return PAGE
+
+
 @app.post("/agent/ask")
 async def agent_ask(
     q: str = Query(..., min_length=3, description="question about the fleet, in English"),
+    session: str | None = Query(None, description="session_id from a previous turn"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
 ):
@@ -458,7 +465,7 @@ async def agent_ask(
         from agent import ops_agent
     except ImportError as e:  # noqa: BLE001
         raise HTTPException(501, f"agent not installed: {e}")
-    return await ops_agent.ask(q)
+    return await ops_agent.ask(q, resume=session)
 
 
 @app.on_event("startup")
