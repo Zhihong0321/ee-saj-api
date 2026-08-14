@@ -33,14 +33,17 @@ MAX_ROWS = 200
 
 SCHEMA = """
 saj_device(device_sn PK, plant_uid, alias, model, rated_power_kw, phase_name,
-           firmware, image_url, last_seen, updated_at)        -- 1,010 inverters
+           firmware, image_url, last_seen, updated_at)
 saj_plant(plant_uid PK, plant_name, owner_name, installer_name, pv_power_wp,
-          running_state, type_name, customer_id)              -- 857 plants
+          running_state, type_name, customer_id)
 saj_customer_device_map(customer_id, device_sn, plant_uid, match_method,
-                        confidence, verified)                 -- 620 rows
+                        confidence, verified)
 saj_reading(device_sn, ts timestamptz, ac_power_w, pv_power_w, today_kwh,
-            month_kwh, year_kwh, total_kwh, device_temp)      -- 15.2M rows, 5-min cadence
+            month_kwh, year_kwh, total_kwh, device_temp)      -- 5-min cadence, ~15M rows
             PRIMARY KEY (device_sn, ts)
+
+Row counts are NOT given here on purpose — they change daily. Never state a
+fleet size, plant count or row count from memory; SELECT it.
 """
 
 SYSTEM = f"""You are the operations analyst for an EPC that monitors 1,010 SAJ solar
@@ -58,6 +61,10 @@ Rules that matter:
 - Daily generation for a device-day is max(today_kwh) for that local day, NOT sum(ac_power_w).
 - A device is "offline" if it has no reading in the last 24h. Check against
   max(ts) of the whole table, not now() — the nightly sweep may not have run.
+  Count offline over ALL rows of saj_device, including devices that have never
+  produced a reading at all. Do not silently narrow it to "devices that have
+  reported before" — newly registered inverters that never came online are the
+  ones worth knowing about. If you do split them out, give the total first.
 - saj_reading is 15M rows. Always bound queries by device_sn and/or a ts range.
 
 Answer with the actual numbers and device serials. Lead with the answer, then
