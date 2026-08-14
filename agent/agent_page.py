@@ -63,7 +63,7 @@ PAGE = r"""<!doctype html>
 <body>
 <div class="wrap">
   <h1>SAJ fleet chat</h1>
-  <div class="sub">Ask about the 1,010-inverter fleet. Read-only — the agent can
+  <div class="sub">Ask about the inverter fleet. Read-only — the agent can
     only run SELECTs against the <code>saj_*</code> tables.</div>
 
   <div class="card">

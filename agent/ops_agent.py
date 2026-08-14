@@ -52,6 +52,9 @@ Tables (prod, read-only):
 Rules that matter:
 - ts is stored UTC. The fleet is in Malaysia — convert with `ts AT TIME ZONE 'Asia/Kuala_Lumpur'`
   for anything a human calls "a day". Never report a raw UTC timestamp as local time.
+- `AT TIME ZONE 'Asia/Kuala_Lumpur'` ALREADY returns Malaysia local time. Report that
+  value as-is. Do NOT add 8 hours to it — doing so is an 8-hour error. Only add 8 hours
+  to a timestamp you selected raw (no AT TIME ZONE in the query that produced it).
 - Daily generation for a device-day is max(today_kwh) for that local day, NOT sum(ac_power_w).
 - A device is "offline" if it has no reading in the last 24h. Check against
   max(ts) of the whole table, not now() — the nightly sweep may not have run.
