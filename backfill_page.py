@@ -30,10 +30,11 @@ PAGE = """<!doctype html>
   .state{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;
          font-weight:700;text-transform:uppercase;letter-spacing:.4px}
   .s-running{background:rgba(46,160,67,.18);color:var(--ok)}
+  .s-syncing{background:rgba(210,153,34,.18);color:var(--warn)}
   .s-stopped,.s-idle{background:rgba(139,148,158,.18);color:var(--dim)}
   .s-stopping{background:rgba(210,153,34,.18);color:var(--warn)}
   .s-done{background:rgba(56,139,253,.18);color:var(--accent)}
-  .s-unavailable{background:rgba(248,81,73,.18);color:var(--bad)}
+  .s-unavailable,.s-failed{background:rgba(248,81,73,.18);color:var(--bad)}
   .bar{height:9px;background:var(--line);border-radius:6px;overflow:hidden;margin:14px 0 6px}
   .bar>i{display:block;height:100%;background:var(--ok);width:0;transition:width .4s}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:14px;
@@ -52,8 +53,9 @@ PAGE = """<!doctype html>
 </head>
 <body>
 <div class="wrap">
-  <h1>SAJ historical copy</h1>
-  <div class="sub">Backfill of the 5-min feed into <span class="mono">saj_reading</span>.
+  <h1>SAJ catalog sync &amp; historical copy</h1>
+  <div class="sub">Synchronizes plants, devices, and customer links before backfilling
+    the 5-min feed into <span class="mono">saj_reading</span>.
     Stop any time &mdash; Start resumes where it left off.
     <span id="policy"></span></div>
 
@@ -84,6 +86,17 @@ PAGE = """<!doctype html>
       <div><div class="k">ETA</div><div class="v" id="eta">-</div></div>
     </div>
     <div class="note" id="jobmsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Plant &amp; customer synchronization</h2>
+    <div class="grid">
+      <div><div class="k">Sync state</div><div class="v" id="syncstate">-</div></div>
+      <div><div class="k">Plants / devices</div><div class="v" id="synccatalog">-</div></div>
+      <div><div class="k">New links / maps</div><div class="v" id="synclinks">-</div></div>
+      <div><div class="k">Needs review</div><div class="v" id="syncreview">-</div></div>
+    </div>
+    <div class="err" id="syncerror"></div>
   </div>
 
   <div class="card" id="wcard" style="display:none">
@@ -137,6 +150,12 @@ async function poll(){
   $('rows').textContent = nf(s.rows_written);
   $('wk').textContent = s.workers_alive+' / '+s.workers_configured;
   $('el').textContent = dur(s.elapsed_seconds);
+  $('syncstate').textContent = s.sync_state || 'pending';
+  $('synccatalog').textContent = nf(s.sync_plants)+' / '+nf(s.sync_devices);
+  $('synclinks').textContent = nf(s.sync_plant_links)+' / '+nf(s.sync_device_maps);
+  $('syncreview').textContent = nf((s.sync_unmatched||0) +
+    (s.sync_ambiguous||0) + (s.sync_conflicts||0));
+  $('syncerror').textContent = s.sync_error || '';
 
   let eta = '-';
   if (s.elapsed_seconds && s.device_days_done > 0 && st === 'running'){
@@ -146,8 +165,8 @@ async function poll(){
   }
   $('eta').textContent = eta;
   $('jobmsg').textContent = s.message || '';
-  $('start').disabled = (st === 'running' || st === 'stopping');
-  $('stop').disabled  = (st !== 'running' && st !== 'stopping');
+  $('start').disabled = (st === 'syncing' || st === 'running' || st === 'stopping');
+  $('stop').disabled  = (st !== 'syncing' && st !== 'running' && st !== 'stopping');
 
   const wn = s.worker_now || {};
   const ks = Object.keys(wn).sort();

@@ -41,6 +41,7 @@ import datetime as dt
 
 import pg
 import fetcher
+import sync_customer_plants
 from saj_api import SajClient
 
 # Capture policy: keep this many months of history, and no more. Rolling —
@@ -61,6 +62,7 @@ _db_lock = threading.Lock()
 _stop = threading.Event()
 _threads: list[threading.Thread] = []
 _threads_lock = threading.Lock()
+_start_lock = threading.Lock()
 
 # Live per-worker view for the page (best-effort, not persisted).
 _worker_now: dict[str, str] = {}
@@ -89,7 +91,30 @@ def ensure_schema():
              started_at   timestamptz,
              stopped_at   timestamptz,
              message      text,
+             sync_state   text not null default 'pending',
+             sync_plants  int not null default 0,
+             sync_devices int not null default 0,
+             sync_plant_links int not null default 0,
+             sync_device_maps int not null default 0,
+             sync_unmatched int not null default 0,
+             sync_ambiguous int not null default 0,
+             sync_conflicts int not null default 0,
+             sync_error text,
+             sync_started_at timestamptz,
+             sync_finished_at timestamptz,
              updated_at   timestamptz not null default now())""")
+    _db("""alter table saj_backfill_job
+             add column if not exists sync_state text not null default 'pending',
+             add column if not exists sync_plants int not null default 0,
+             add column if not exists sync_devices int not null default 0,
+             add column if not exists sync_plant_links int not null default 0,
+             add column if not exists sync_device_maps int not null default 0,
+             add column if not exists sync_unmatched int not null default 0,
+             add column if not exists sync_ambiguous int not null default 0,
+             add column if not exists sync_conflicts int not null default 0,
+             add column if not exists sync_error text,
+             add column if not exists sync_started_at timestamptz,
+             add column if not exists sync_finished_at timestamptz""")
     _db("""create table if not exists saj_backfill_device (
              device_sn    text primary key,
              cursor_day   date,
@@ -110,6 +135,22 @@ def _seed_devices() -> int:
                select d.device_sn from saj_device d
                on conflict (device_sn) do nothing""")
     return r.get("rowcount") or 0
+
+
+def _sync_catalog() -> dict:
+    """Refresh plants/devices and apply safe customer links before history copy."""
+    summary = sync_customer_plants.run(apply=True, db_lock=_db_lock)
+    applied = summary.get("applied") or {}
+    return {
+        "plants": int(summary.get("portal_plants") or 0),
+        "devices": int(summary.get("portal_devices") or 0),
+        "plant_links": int(applied.get("plants_linked") or 0),
+        "device_maps": int(applied.get("device_maps_inserted") or 0),
+        "unmatched": int(summary.get("unmatched_plants") or 0),
+        "ambiguous": int(summary.get("ambiguous_plants") or 0),
+        "conflicts": (int(summary.get("conflict_plants") or 0)
+                      + int(summary.get("invalid_existing_links") or 0)),
+    }
 
 
 # ---- job state ------------------------------------------------------------
@@ -266,12 +307,13 @@ def _maybe_finish():
         left = _rows("select count(*) as n from saj_backfill_device where not done")
         remaining = int(left[0]["n"]) if left else 0
         if _stop.is_set():
-            _set_state("stopped", stopped_at=dt.datetime.utcnow(),
+            _set_state("stopped", stopped_at=dt.datetime.now(dt.timezone.utc),
                        message=f"stopped with {remaining} devices remaining")
         elif remaining == 0:
-            _set_state("done", stopped_at=dt.datetime.utcnow(), message="copy complete")
+            _set_state("done", stopped_at=dt.datetime.now(dt.timezone.utc),
+                       message="history copy and plant/customer sync complete")
         else:
-            _set_state("stopped", stopped_at=dt.datetime.utcnow(),
+            _set_state("stopped", stopped_at=dt.datetime.now(dt.timezone.utc),
                        message=f"workers exited with {remaining} devices remaining")
     except Exception as e:  # noqa: BLE001
         print(f"[backfill] finish bookkeeping failed: {e}", flush=True)
@@ -279,12 +321,21 @@ def _maybe_finish():
 
 # ---- control --------------------------------------------------------------
 def start(window_start: str | None = None) -> dict:
-    """Begin (or resume) the copy. Safe to call when already running."""
+    """Synchronize the catalog, then begin (or resume) the history copy."""
+    if not _start_lock.acquire(blocking=False):
+        return {"status": "already_running", **status()}
+    try:
+        return _start(window_start)
+    finally:
+        _start_lock.release()
+
+
+def _start(window_start: str | None = None) -> dict:
     if not PASSWORD:
         raise RuntimeError("BACKFILL_PASS / SAJ_PASS not set")
     ensure_schema()
     j = job()
-    if j and j["state"] == "running" and _alive():
+    if j and j["state"] in ("syncing", "running", "stopping") and _alive():
         return {"status": "already_running", **status()}
 
     prev_ws = _as_date(j["window_start"]) if j else None
@@ -297,34 +348,80 @@ def start(window_start: str | None = None) -> dict:
         print(f"[backfill] {requested} is older than the {POLICY_MONTHS}-month "
               f"policy; clamped to {floor}", flush=True)
     we = _window_end()
-    _seed_devices()
+    _stop.clear()
 
-    # Widening the window backwards must re-open devices already marked done,
-    # or the older days would never be visited. Days already in saj_reading are
-    # still skipped per-device, so re-opening costs no extra SAJ calls.
-    if prev_ws and ws < prev_ws:
-        _db("update saj_backfill_device set done=false, cursor_day=null, days_done=0, "
-            "claimed_by=null, claimed_at=null, updated_at=now()")
-        print(f"[backfill] window widened {prev_ws} -> {ws}; re-opened all devices",
-              flush=True)
-
-    # Days pass between runs, so a device that finished against an older
-    # window_end is no longer actually complete. Re-open those; the per-device
-    # skip of days already stored keeps this cheap.
-    _db("update saj_backfill_device set done=false, claimed_by=null, claimed_at=null, "
-        "updated_at=now() where done and (cursor_day is null or cursor_day <= $1::date)",
-        [we.isoformat()])
     if j:
-        _db("update saj_backfill_job set state='running', window_start=$1, window_end=$2, "
+        _db("update saj_backfill_job set state='syncing', window_start=$1, window_end=$2, "
             "workers=$3, started_at=coalesce(started_at, now()), stopped_at=null, "
-            "message=null, updated_at=now() where id=1",
+            "message='syncing SAJ plants, devices, and customers', "
+            "sync_state='running', sync_plants=0, sync_devices=0, sync_plant_links=0, "
+            "sync_device_maps=0, sync_unmatched=0, sync_ambiguous=0, sync_conflicts=0, "
+            "sync_error=null, sync_started_at=now(), sync_finished_at=null, "
+            "updated_at=now() where id=1",
             [ws.isoformat(), we.isoformat(), len(USERS)])
     else:
-        _db("insert into saj_backfill_job (id, state, window_start, window_end, workers, "
-            "started_at) values (1,'running',$1,$2,$3, now())",
+        _db("insert into saj_backfill_job "
+            "(id,state,window_start,window_end,workers,started_at,message,"
+            "sync_state,sync_started_at) "
+            "values (1,'syncing',$1,$2,$3,now(),"
+            "'syncing SAJ plants, devices, and customers','running',now())",
             [ws.isoformat(), we.isoformat(), len(USERS)])
 
-    _stop.clear()
+    try:
+        synced = _sync_catalog()
+    except Exception as e:  # noqa: BLE001
+        msg = f"catalog/customer sync failed: {e}"[:400]
+        _set_state("failed", stopped_at=dt.datetime.now(dt.timezone.utc), message=msg,
+                   sync_state="failed", sync_error=msg,
+                   sync_finished_at=dt.datetime.now(dt.timezone.utc))
+        raise RuntimeError(msg) from e
+
+    review = synced["unmatched"] + synced["ambiguous"] + synced["conflicts"]
+    sync_message = (
+        f"catalog synced: {synced['plants']} plants, {synced['devices']} devices; "
+        f"linked {synced['plant_links']} plants and {synced['device_maps']} devices; "
+        f"{review} plants need review"
+    )
+    _set_state("syncing", message=sync_message, sync_state="done",
+               sync_plants=synced["plants"], sync_devices=synced["devices"],
+               sync_plant_links=synced["plant_links"],
+               sync_device_maps=synced["device_maps"],
+               sync_unmatched=synced["unmatched"],
+               sync_ambiguous=synced["ambiguous"],
+               sync_conflicts=synced["conflicts"],
+               sync_error=None, sync_finished_at=dt.datetime.now(dt.timezone.utc))
+    if _stop.is_set():
+        _set_state("stopped", stopped_at=dt.datetime.now(dt.timezone.utc),
+                   message=f"stopped after {sync_message}")
+        return {"status": "stopped", **status()}
+
+    try:
+        seeded = _seed_devices()
+
+        # Widening the window backwards must re-open devices already marked done,
+        # or the older days would never be visited. Days already in saj_reading are
+        # still skipped per-device, so re-opening costs no extra SAJ calls.
+        if prev_ws and ws < prev_ws:
+            _db("update saj_backfill_device set done=false, cursor_day=null, days_done=0, "
+                "claimed_by=null, claimed_at=null, updated_at=now()")
+            print(f"[backfill] window widened {prev_ws} -> {ws}; re-opened all devices",
+                  flush=True)
+
+        # Days pass between runs, so a device that finished against an older
+        # window_end is no longer actually complete. Re-open those; the per-device
+        # skip of days already stored keeps this cheap.
+        _db("update saj_backfill_device set done=false, claimed_by=null, claimed_at=null, "
+            "updated_at=now() where done and (cursor_day is null or cursor_day <= $1::date)",
+            [we.isoformat()])
+        _db("update saj_backfill_job set state='running', window_start=$1, window_end=$2, "
+            "workers=$3, stopped_at=null, message=$4, updated_at=now() where id=1",
+            [ws.isoformat(), we.isoformat(), len(USERS),
+             f"{sync_message}; {seeded} new devices queued"])
+    except Exception as e:  # noqa: BLE001
+        msg = f"backfill preparation failed after catalog sync: {e}"[:400]
+        _set_state("failed", stopped_at=dt.datetime.now(dt.timezone.utc), message=msg)
+        raise RuntimeError(msg) from e
+
     with _threads_lock:
         _threads.clear()
         for i, user in enumerate(USERS):
@@ -359,7 +456,7 @@ def resume_if_interrupted():
     except Exception as e:  # noqa: BLE001
         print(f"[backfill] startup check skipped: {e}", flush=True)
         return
-    if j and j["state"] in ("running", "stopping") and not _alive():
+    if j and j["state"] in ("syncing", "running", "stopping") and not _alive():
         print("[backfill] job was interrupted — auto-resuming", flush=True)
         try:
             start()
@@ -407,6 +504,15 @@ def status() -> dict:
         "device_days_total": total_days,
         "pct": round(100.0 * days_done / total_days, 2) if total_days else 0.0,
         "rows_written": int(a.get("rows_written") or 0),
+        "sync_state": (j or {}).get("sync_state", "pending"),
+        "sync_plants": int((j or {}).get("sync_plants") or 0),
+        "sync_devices": int((j or {}).get("sync_devices") or 0),
+        "sync_plant_links": int((j or {}).get("sync_plant_links") or 0),
+        "sync_device_maps": int((j or {}).get("sync_device_maps") or 0),
+        "sync_unmatched": int((j or {}).get("sync_unmatched") or 0),
+        "sync_ambiguous": int((j or {}).get("sync_ambiguous") or 0),
+        "sync_conflicts": int((j or {}).get("sync_conflicts") or 0),
+        "sync_error": (j or {}).get("sync_error"),
         "policy_months": POLICY_MONTHS,
         "policy_floor": policy_floor().isoformat(),
         "workers_configured": len(USERS),

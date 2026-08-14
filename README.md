@@ -72,6 +72,36 @@ smoke test) — set it before real use.
    current prod DB; the file is here for a fresh environment.
 4. Deploy. Hit `/health` to confirm `db_backend: database_url`.
 
+## Customer → plant catalog sync
+
+`sync_customer_plants.py` refreshes the SAJ plant/device catalog and links every
+unlinked plant whose normalized `plantName` matches exactly one
+`customer.name`. One customer may be linked to multiple plants. Existing plant
+links and device mappings are never overwritten; ambiguous or conflicting plants
+are reported for later invoice-assisted/manual resolution.
+
+Starting `/backfill` now runs this synchronization in apply mode first, then seeds
+the historical queue from the refreshed device catalog. The backfill page reports
+catalog totals, new plant/customer links, new customer/device mappings, and plants
+that still need review. If synchronization fails, history copying does not start.
+This automatic path requires the deployed service to use a direct `DATABASE_URL`.
+
+For a standalone review, dry-run remains the default:
+
+```bash
+python sync_customer_plants.py
+```
+
+After reviewing the JSON summary, apply it with a direct production database
+connection:
+
+```bash
+python sync_customer_plants.py --apply
+```
+
+`--apply` requires `DATABASE_URL`; write mode deliberately refuses the HTTP proxy.
+Use the same `SAJ_USER`, `SAJ_PASS`, and `DATABASE_URL` as the deployed service.
+
 ## Two operating modes
 
 **Daytime — sync per visit (on-demand).** When a customer opens the app, have the
