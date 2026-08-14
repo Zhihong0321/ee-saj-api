@@ -86,7 +86,7 @@ PAGE = r"""<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const tok = $('token'), log = $('log'), q = $('q'), send = $('send'), status = $('status');
-let session = null, spent = 0;
+let session = null;
 
 tok.value = localStorage.getItem('saj_bf_token') || '';
 tok.addEventListener('input', () => localStorage.setItem('saj_bf_token', tok.value));
@@ -177,13 +177,12 @@ async function ask(){
     if (!r.ok) throw new Error(errText(body, r, raw));
     if (!body) throw new Error('server sent a non-JSON reply: ' + raw.slice(0, 200));
     session = body.session_id;
-    spent += body.cost_usd;
     const secs = ((Date.now()-t0)/1000).toFixed(0);
     b.innerHTML = md(body.answer);
     const m = document.createElement('div');
     m.className = 'meta';
     m.innerHTML = `${body.sql.length} quer${body.sql.length===1?'y':'ies'} &middot; ${secs}s
-                   &middot; $${body.cost_usd.toFixed(4)}
+                   &middot; ${esc(body.model || '?')}
                    ${body.sql.length ? '&middot; <button>show SQL</button>' : ''}`;
     if (body.sql.length){
       const pre = document.createElement('pre');
@@ -203,7 +202,7 @@ async function ask(){
   } finally {
     clearInterval(tick);
     send.disabled = false;
-    status.textContent = `session total $${spent.toFixed(4)}`;
+    status.textContent = 'Enter sends · Shift+Enter for a new line';
     q.focus();
   }
 }
@@ -212,7 +211,7 @@ send.onclick = ask;
 q.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); ask(); }
 });
-$('reset').onclick = () => { session = null; spent = 0; log.innerHTML = '';
+$('reset').onclick = () => { session = null; log.innerHTML = '';
                              status.textContent = 'new chat'; q.focus(); };
 q.focus();
 </script>

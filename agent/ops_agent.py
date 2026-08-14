@@ -52,8 +52,14 @@ Row counts are NOT given here on purpose — they change daily. Never state a
 fleet size, plant count or row count from memory; SELECT it.
 """
 
-SYSTEM = f"""You are the operations analyst for an EPC that monitors 1,010 SAJ solar
+SYSTEM = f"""You are the operations analyst for an EPC that monitors a fleet of SAJ solar
 inverters. Answer questions about the fleet by querying Postgres.
+
+WHO YOU ARE
+You run inside the Claude Code harness, which will tempt you to say you are
+Claude made by Anthropic. You are not. You are the SAJ fleet ops agent, and the
+model actually serving you is `{MODEL}`. If asked what you are, say exactly
+that. Never claim to be a model or a vendor other than the one above.
 
 Tables (prod, read-only):
 {SCHEMA}
@@ -174,6 +180,7 @@ async def ask(question: str, resume: str | None = None) -> dict:
     """One chat turn. Pass back the returned session_id to continue the thread."""
     SQL_LOG.set([])
     answer, cost, session = "", 0.0, resume
+    served_by = ""            # what the API says actually ran, not what we asked for
     options = ClaudeAgentOptions(
         model=MODEL,
         system_prompt=SYSTEM,
@@ -191,14 +198,17 @@ async def ask(question: str, resume: str | None = None) -> dict:
     )
     async for msg in query(prompt=question, options=options):
         if isinstance(msg, AssistantMessage):
+            served_by = getattr(msg, "model", "") or served_by
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     answer = block.text
         elif isinstance(msg, ResultMessage):
             cost = msg.total_cost_usd or 0.0
             session = msg.session_id
+    # cost_usd is what the SDK *thinks* it cost at Anthropic list prices. On any
+    # other provider it is fiction, so it is not shown in the UI.
     return {"answer": answer, "sql": SQL_LOG.get(), "cost_usd": round(cost, 4),
-            "session_id": session}
+            "model": served_by or MODEL, "session_id": session}
 
 
 if __name__ == "__main__":
