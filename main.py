@@ -56,7 +56,7 @@ HISTORY_MAX_DAYS = int(os.environ.get("HISTORY_MAX_DAYS", "31"))
 # than this (data is 5-min cadence, so ~4 min avoids redundant pulls on refresh).
 VISIT_FRESH_SECONDS = int(os.environ.get("VISIT_FRESH_SECONDS", "240"))
 
-app = FastAPI(title="EE SAJ Data Fetcher", version="1.2.0")
+app = FastAPI(title="EE SAJ Data Fetcher", version="1.3.0")
 
 _lock = threading.Lock()
 _client: SajClient | None = None
@@ -82,6 +82,10 @@ def health():
     return {
         "ok": True,
         "service": "ee-saj-api",
+        "version": app.version,
+        "revision": os.environ.get("RAILWAY_GIT_COMMIT_SHA"),
+        "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID"),
+        "environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME"),
         "db_backend": pg.backend(),
         "saj_account": SAJ_USER,
         "protected": bool(TRIGGER_TOKEN),
@@ -437,6 +441,24 @@ def maintenance_retention_status():
         return {**_ret_state, "stats": retention.stats()}
     except Exception as e:  # noqa: BLE001
         return {**_ret_state, "stats_error": str(e)}
+
+
+# ---- ops agent (PROTOTYPE) ------------------------------------------------
+# Natural-language questions about the fleet, answered by a Claude Agent SDK
+# agent whose only tool is a read-only SELECT against the saj_* tables.
+# Imported lazily so a missing claude-agent-sdk can never take down the fetcher.
+@app.post("/agent/ask")
+async def agent_ask(
+    q: str = Query(..., min_length=3, description="question about the fleet, in English"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    _check_auth(token or x_trigger_token)
+    try:
+        from agent import ops_agent
+    except ImportError as e:  # noqa: BLE001
+        raise HTTPException(501, f"agent not installed: {e}")
+    return await ops_agent.ask(q)
 
 
 @app.on_event("startup")

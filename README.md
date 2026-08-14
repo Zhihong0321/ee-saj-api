@@ -6,8 +6,8 @@ Railway. It is the **write side** of the pipeline — the client app only reads
 `saj_reading` back out.
 
 You trigger a fetch by **device serial** or **plant UID**; the service logs into
-the SAJ portal (auto-relogin on token expiry), pulls the raw 5-min rows, and
-upserts them into Postgres.
+the SAJ portal (auto-relogin on token expiry), pulls today's raw rows plus compact
+chart data for completed historical days, and upserts them into Postgres.
 
 **Live:** https://ee-saj-api-production.up.railway.app · interactive docs at
 [`/docs`](https://ee-saj-api-production.up.railway.app/docs).
@@ -101,7 +101,8 @@ Railway runs the start command on the schedule; the script sweeps the fleet
 ## Config (env vars)
 
 See `.env.example`. Nothing secret is committed — all credentials come from
-Railway Variables.
+Railway Variables. `SAJ_HISTORY_SOURCE=chart` is the optimized default for
+completed days; set it to `raw` to temporarily restore the legacy history path.
 
 ## Local dev
 
@@ -111,6 +112,39 @@ cp .env.example .env    # fill in SAJ_PASS and either DATABASE_URL or PG_PROXY_T
 # load .env into your shell, then:
 uvicorn main:app --reload
 ```
+
+## Pre-push validation
+
+Run the deterministic gate before every push. It compiles the production
+modules, runs all unit tests, and checks the patch for whitespace errors:
+
+```powershell
+.\prepush.ps1
+```
+
+After a push to `main`, the `Validate` GitHub Actions workflow waits until the
+Railway `/health` endpoint reports that exact Git commit. It then tests the
+deployed production service end to end by force-refreshing one real device for
+today plus yesterday, checking the response time and stored series, and reading
+the data back from production Postgres. The refresh is an idempotent upsert.
+
+The production job uses the existing `SYNC_TRIGGER_TOKEN` GitHub secret and
+uploads `prod-smoke-report.json` as a 14-day workflow artifact. A failed Railway
+deployment, wrong revision, SAJ error, missing completed-day history, database
+readback failure, or slow fetch fails the workflow.
+
+To run the same check manually after a deployment, put the production trigger
+token in the current shell and run:
+
+```powershell
+$env:PROD_TRIGGER_TOKEN = "<production TRIGGER_TOKEN>"
+.\prodcheck.ps1
+```
+
+`prodcheck.ps1` derives the expected revision from local `HEAD`, waits up to 15
+minutes for that revision to reach Railway, and writes the gitignored report to
+`.debug/prod-smoke-report.json`. The token is sent only in the request header and
+is redacted from failures.
 
 ## Notes
 

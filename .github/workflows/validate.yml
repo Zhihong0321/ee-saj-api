@@ -1,0 +1,56 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run unit tests
+        run: python -m unittest -v
+      - name: Compile production and diagnostic modules
+        run: >-
+          python -m py_compile saj_api.py fetcher.py backfill.py main.py
+          sync_all.py prod_smoke.py test_saj_optimization.py test_prod_smoke.py
+
+  production-smoke:
+    needs: offline-validation
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: ee-saj-api-production-smoke
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install smoke-test dependency
+        run: pip install requests==2.32.3
+      - name: Wait for deployment and test production
+        env:
+          PROD_TRIGGER_TOKEN: ${{ secrets.SYNC_TRIGGER_TOKEN }}
+        run: >-
+          python prod_smoke.py
+          --base-url https://ee-saj-api-production.up.railway.app
+          --device-sn R6M2053J2623E08431
+          --expected-revision ${{ github.sha }}
+          --json-out prod-smoke-report.json
+      - name: Upload production diagnostic report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-smoke-${{ github.sha }}
+          path: prod-smoke-report.json
+          if-no-files-found: error
+          retention-days: 14

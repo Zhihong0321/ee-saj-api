@@ -55,7 +55,6 @@ USERS = [u.strip() for u in
 PASSWORD = os.environ.get("BACKFILL_PASS") or os.environ.get("SAJ_PASS")
 REQ_INTERVAL = float(os.environ.get("BACKFILL_REQ_INTERVAL", "0.05"))
 CLAIM_TTL_MIN = 15
-PAGE_SIZE = 1000  # measured ceiling: 1000 works, >1000 returns 10 rows
 
 # pg keeps one module-level connection; serialise our worker threads on it.
 _db_lock = threading.Lock()
@@ -150,24 +149,10 @@ def policy_floor() -> dt.date:
     return _months_ago(_myt_today(), POLICY_MONTHS)
 
 
-# ---- SAJ paging (correct: pages on `total`) --------------------------------
-def _raw_day(client, sn: str, day: str) -> list:
-    """Every 5-min row for one device-day.
-
-    Deliberately does NOT use SajClient.raw_data_day: the API always returns
-    hasNextPage=False / pages=0 even when more pages exist, so that helper stops
-    after page 1. `total` IS accurate, so page on that instead.
-    """
-    out, page = [], 1
-    while True:
-        env = client.raw_data_page(sn, day, page_no=page, page_size=PAGE_SIZE)
-        batch = env.get("list") or []
-        out.extend(batch)
-        total = env.get("total") or 0
-        if not batch or len(out) >= total:
-            break
-        page += 1
-    return out
+# ---- SAJ history -----------------------------------------------------------
+def _history_day(client, sn: str, day: str) -> list:
+    """Completed-day curve via compact chart data, with raw fallback."""
+    return fetcher._completed_day_rows(client, sn, day)
 
 
 def _existing_days(sn: str, start: dt.date, end: dt.date) -> set:
@@ -234,7 +219,7 @@ def _worker(worker: str, user: str, win_start: dt.date, win_end: dt.date):
             _worker_now[worker] = f"{sn} {day}"
             try:
                 if day not in have:
-                    rows = _raw_day(client, sn, day.isoformat())
+                    rows = _history_day(client, sn, day.isoformat())
                     if rows:
                         with _db_lock:
                             n = fetcher._upsert_readings(sn, rows)

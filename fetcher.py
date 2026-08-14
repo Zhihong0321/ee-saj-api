@@ -9,8 +9,9 @@ The reader shifts back to Asia/Kuala_Lumpur for display.
 """
 from __future__ import annotations
 
-import time
 import datetime as dt
+import os
+import time
 
 import pg
 import r2
@@ -18,6 +19,10 @@ import r2
 # When we last pulled each device from SAJ (in-process; resets on redeploy).
 # Powers the per-visit freshness gate so rapid re-opens don't re-hit the portal.
 _last_pull: dict[str, float] = {}
+
+# Completed days can use SAJ's compact chart response (~40–50x smaller than
+# the raw operating-data response). Set to "raw" for an emergency rollback.
+HISTORY_SOURCE = os.environ.get("SAJ_HISTORY_SOURCE", "chart").strip().lower()
 
 # saj_reading columns we populate (raw jsonb left null — charts don't need it)
 _COLS = ["device_sn", "ts", "ac_power_w", "pv_power_w", "today_kwh",
@@ -55,14 +60,32 @@ def _upsert_readings(sn: str, rows: list[dict], batch: int = 200) -> int:
         sql = (f"insert into saj_reading ({','.join(_COLS)}) values {ph} "
                "on conflict (device_sn,ts) do update set "
                "ac_power_w=excluded.ac_power_w, pv_power_w=excluded.pv_power_w, "
-               "today_kwh=excluded.today_kwh, month_kwh=excluded.month_kwh, "
-               "year_kwh=excluded.year_kwh, total_kwh=excluded.total_kwh, "
-               "device_temp=excluded.device_temp")
+               "today_kwh=excluded.today_kwh, "
+               "month_kwh=coalesce(excluded.month_kwh,saj_reading.month_kwh), "
+               "year_kwh=coalesce(excluded.year_kwh,saj_reading.year_kwh), "
+               "total_kwh=coalesce(excluded.total_kwh,saj_reading.total_kwh), "
+               "device_temp=coalesce(excluded.device_temp,saj_reading.device_temp)")
         res = pg.run(sql, params)
         if isinstance(res, dict) and "error" in res:
             raise RuntimeError(f"upsert {sn} failed: {res}")
         written += len(chunk)
     return written
+
+
+def _completed_day_rows(client, device_sn: str, day: str) -> list[dict]:
+    """Fetch a completed MYT day compactly, with a raw-data safety fallback."""
+    if HISTORY_SOURCE == "raw":
+        return client.raw_data_day(device_sn, day)
+    try:
+        rows = client.generation_chart_day(device_sn, day)
+        if rows:
+            return rows
+        print(f"[history] {device_sn} {day} empty chart; falling back to raw",
+              flush=True)
+    except Exception as e:  # noqa: BLE001 — raw is the compatibility fallback
+        print(f"[history] {device_sn} {day} chart failed: {e}; falling back to raw",
+              flush=True)
+    return client.raw_data_day(device_sn, day)
 
 
 def latest(device_sn: str):
@@ -145,7 +168,8 @@ def fetch_device(client, device_sn: str, days: int = 1,
     today = dt.date.today()
     for i in range(days):
         day = (today - dt.timedelta(days=i)).isoformat()
-        rows = client.raw_data_day(device_sn, day)
+        rows = (client.raw_data_day(device_sn, day) if i == 0 else
+                _completed_day_rows(client, device_sn, day))
         total += _upsert_readings(device_sn, rows)
     _last_pull[device_sn] = time.time()
     # Opportunistically fill model info while we're already talking to SAJ.
@@ -201,7 +225,8 @@ def fetch_device_history(client, device_sn: str, days: int = 31,
         if i != 0 and not force and _day_has_rows(device_sn, day):
             skipped += 1
             continue
-        rows = client.raw_data_day(device_sn, day)
+        rows = (client.raw_data_day(device_sn, day) if i == 0 else
+                _completed_day_rows(client, device_sn, day))
         total += _upsert_readings(device_sn, rows)
         pulled += 1
     _last_pull[device_sn] = time.time()

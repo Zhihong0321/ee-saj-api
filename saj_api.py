@@ -239,17 +239,85 @@ class SajClient:
             "pageSize": page_size,
         })
 
-    def raw_data_day(self, device_sn: str, day: str, device_type: int = 0) -> list:
-        """All 5-min rows for a device-day, oldest→newest, following pagination."""
+    def raw_data_day(self, device_sn: str, day: str, device_type: int = 0,
+                     page_size: int = 1000) -> list:
+        """All raw rows for a device-day, oldest→newest.
+
+        SAJ returns ``hasNextPage=False`` and ``pages=0`` even when more rows
+        exist.  ``total`` is accurate, so pagination must be driven by the
+        number of rows collected instead.
+        """
         rows, page = [], 1
         while True:
             env = self.raw_data_page(device_sn, day, page_no=page,
-                                     page_size=300, device_type=device_type)
-            rows.extend(env.get("list", []))
-            if not env.get("hasNextPage"):
+                                     page_size=page_size, device_type=device_type)
+            batch = env.get("list") or []
+            rows.extend(batch)
+            try:
+                total = int(env.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if not batch or (total and len(rows) >= total):
+                break
+            # Without a usable total, a short page is the only safe stop signal.
+            if not total and len(batch) < page_size:
                 break
             page += 1
         rows.sort(key=lambda r: r.get("datetime") or "")
+        return rows
+
+    def common_chart_day(self, device_sn: str, day: str) -> dict:
+        """Compact 5-minute chart data for one completed device-day."""
+        return self.call("/api/v2/monitor/plant/chart/getCommonChartData", {
+            "chartDateType": 1,
+            "chartDay": day,
+            "snType": 1,
+            "deviceSn": device_sn,
+            "commonChartType": 1,
+        })
+
+    def generation_chart_day(self, device_sn: str, day: str) -> list[dict]:
+        """Return compact chart data in the raw-row shape used by ``fetcher``.
+
+        The chart response is roughly 40–50x smaller than ``findRawdataPageList``
+        for the same day.  It contains the fields needed by the stored power
+        curve and daily-energy readers, but intentionally leaves diagnostic
+        values such as temperature and lifetime energy absent.
+        """
+        data = self.common_chart_day(device_sn, day)
+        return self.generation_rows_from_chart(data, day)
+
+    @staticmethod
+    def generation_rows_from_chart(data: dict, day: str) -> list[dict]:
+        """Normalize an already-fetched common-chart response into raw rows."""
+        x_axis = data.get("xAxis") or {}
+        times = x_axis.get("coordinateList") or []
+        series = {
+            item.get("legendKey"): item.get("dataList") or []
+            for item in (data.get("yAxis") or [])
+            if item.get("legendKey")
+        }
+        ac_power = series.get("AC_OUTPUT_POWER") or []
+        energy = series.get("ENERGY_CURVE") or []
+        if not times or len(ac_power) != len(times) or len(energy) != len(times):
+            return []
+
+        pv_series = [values for key, values in series.items()
+                     if key.startswith("Pow") and len(values) == len(times)]
+        rows = []
+        for i, clock in enumerate(times):
+            pv_values = []
+            for values in pv_series:
+                try:
+                    pv_values.append(float(values[i]))
+                except (TypeError, ValueError, IndexError):
+                    pass
+            rows.append({
+                "datetime": f"{day} {clock}",
+                "pac": ac_power[i],
+                "PVP": sum(pv_values) if pv_values else None,
+                "todayPVEnergy": energy[i],
+            })
         return rows
 
     def latest_reading(self, device_sn: str, device_type: int = 0) -> dict | None:
@@ -262,7 +330,35 @@ class SajClient:
     # ---- fleet enumeration ------------------------------------------------
     def plant_status_num(self) -> dict:
         """Fleet health counts: {totalNum, normalNum, offlineNum, alarmNum}."""
-        return self.call("/api/v2/monitor/plant/getUserPlantListStatusNum")
+        return self.call(
+            "/api/v2/monitor/inverter/getUserInverterListStatusNum")
+
+    def list_inverters(self, page_size: int = 100) -> list:
+        """All inverter records in a few paged calls.
+
+        This replaces the old plant-list plus one-device-list-call-per-plant
+        enumeration path.
+        """
+        devices, page = [], 1
+        while True:
+            env = self.call("/api/v2/monitor/inverter/userInverterPage", {
+                "pageNo": page,
+                "pageSize": page_size,
+                "sortFieldType": 1,
+                "sortDirection": 1,
+            })
+            batch = env.get("list") or []
+            devices.extend(batch)
+            try:
+                total = int(env.get("total") or 0)
+            except (TypeError, ValueError):
+                total = 0
+            if not batch or (total and len(devices) >= total):
+                break
+            if not total and len(batch) < page_size:
+                break
+            page += 1
+        return devices
 
     def list_plants(self, page_size: int = 100) -> list:
         """All plants (paged), each with plantUid/plantName/runningState/…."""
@@ -286,11 +382,12 @@ class SajClient:
 
     def iter_all_devices(self, page_size: int = 100):
         """Yield (plant_uid, plant_name, device_sn) across the whole fleet."""
-        for p in self.list_plants(page_size=page_size):
-            uid = p.get("plantUid")
-            name = p.get("plantName")
-            for sn in self.plant_device_sns(uid):
-                yield uid, name, sn
+        seen = set()
+        for device in self.list_inverters(page_size=page_size):
+            sn = device.get("deviceSn")
+            if sn and sn not in seen:
+                seen.add(sn)
+                yield device.get("plantUid"), device.get("plantName"), sn
 
 
 if __name__ == "__main__":
