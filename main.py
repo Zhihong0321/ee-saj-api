@@ -296,6 +296,32 @@ def device_info(device_sn: str):
     return info
 
 
+@app.get("/debug/saj-rawday/{device_sn}")
+def debug_saj_rawday(device_sn: str,
+                     day: str | None = Query(None, description="MYT day; default today"),
+                     token: str | None = Query(None),
+                     x_trigger_token: str | None = Header(None)):
+    """What SAJ actually hands THIS server for a device-day, before any DB write.
+
+    Isolates the 17:55 question: if `last` here is ~19:15, the truncation is in
+    our write; if it's ~17:55, SAJ's response to this host is already clipped.
+    """
+    _check_auth(token or x_trigger_token)
+    d = day or fetcher._myt_today().isoformat()
+    with _lock:
+        client = _get_client()
+        rows = client.raw_data_day(device_sn, d)
+    ts = sorted((r.get("datetime") or "") for r in rows if r.get("datetime"))
+    return {
+        "device_sn": device_sn, "day": d, "count": len(rows),
+        "first": ts[0] if ts else None, "last": ts[-1] if ts else None,
+        "account": _primary_username(),
+        "server_utc": dt.datetime.utcnow().isoformat() + "Z",
+        "server_date_today": str(dt.date.today()),
+        "myt_today": fetcher._myt_today().isoformat(),
+    }
+
+
 @app.get("/device/{device_sn}/latest")
 def device_latest(device_sn: str):
     return {"device_sn": device_sn, "latest": fetcher.latest(device_sn)}
