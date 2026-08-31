@@ -11,10 +11,11 @@ calls before the readings pull. A name the catalog has never seen falls back to
 one live plant-list page-through, and the rows it finds are written into the
 catalog on the way past, so the next run is fast again.
 
-While we are there, an unlinked plant whose name matches exactly one customer is
-linked using the same conservative rule as `sync_customer_plants` — otherwise
-"sync this customer" would quietly sync nothing for the customers that need it
-most, the ones nobody has linked yet.
+While we are there, an unlinked plant is linked to the customer whose name leads
+it. Plants are named "<customer> (<site>) - <installer>" and customer records
+often carry their own suffix, so one name leads the other and exact matching
+links almost nothing — see `customer_for_plant`. One customer owning several
+plants is normal and expected.
 
     python fast_sync.py --customer "Ah Seng"
     python fast_sync.py --plant "Taman Molek" --days 7
@@ -23,6 +24,7 @@ most, the ones nobody has linked yet.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import random
@@ -37,6 +39,7 @@ from saj_api import SajClient
 from sync_customer_plants import (
     MATCH_CONFIDENCE,
     MATCH_METHOD,
+    MATCH_METHOD_PREFIX,
     insert_device_maps,
     link_plants,
     norm_name,
@@ -181,14 +184,62 @@ def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
     return hits
 
 
-def customer_for_name(name: str | None, customers: list[dict]) -> str | None:
-    """The one customer with exactly this name, or None if zero or several."""
-    key = norm_name(name)
-    if not key:
-        return None
-    ids = sorted({str(c["customer_id"]) for c in customers
-                  if norm_name(c.get("name")) == key})
-    return ids[0] if len(ids) == 1 else None
+# A customer name must lead a plant name by at least this many words before we
+# will write a link. One word is not evidence: customer "Tee" leads "Tee Bong
+# Tsong", "Tee Chin Hock" and everyone else called Tee.
+LINK_MIN_WORDS = 2
+
+
+def _leading_words(a: list[str], b: list[str]) -> int:
+    """Shared leading words — but only if one list *completely* leads the other.
+
+    "chan cheng fatt" leads "chan cheng fatt atap" -> 3.
+    "chan cheng fatt" vs "chan cheng zhu"          -> 0, not 2. A partial run of
+    matching words is two different people who share a surname, not evidence.
+    """
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i if i == n else 0
+
+
+def customer_for_plant(plant_name: str | None,
+                       customers: list[dict]) -> tuple[str | None, list[dict]]:
+    """The one customer whose name leads this plant's name. -> (id or None, hits)
+
+    Plants are named "<customer> (<site>) - <installer>" and customer records
+    often carry their own suffix ("(ATAP)"), so one name leads the other:
+
+        customer  CHAN CHENG FATT (ATAP)
+        plant     Chan Cheng Fatt
+        customer  JCLANDS CAPITAL SDN.BHD.
+        plant     JClands capital SDN BHD (Restaurant) - SELCO
+
+    The longest lead wins, so a specific record beats a generic one. Several
+    customers tying at that length means the customer table holds duplicates —
+    returned as `hits` with no id, because picking one at random would silently
+    file a site under the wrong record.
+    """
+    pt = name_tokens(plant_name)
+    if len(pt) < LINK_MIN_WORDS:
+        return None, []
+    best, hits = (0, 0), []
+    for c in customers:
+        ct = name_tokens(c.get("name"))
+        n = _leading_words(ct, pt)
+        if n < LINK_MIN_WORDS:
+            continue
+        # Longest lead wins, so a specific record beats a generic stem. An exact
+        # name breaks a tie: plant "Ah Seng" leads customer "Ah Seng Trading"
+        # just as far as it leads "Ah Seng", and the latter is the better answer.
+        rank = (n, 1 if ct == pt else 0)
+        if rank > best:
+            best, hits = rank, [c]
+        elif rank == best:
+            hits.append(c)
+    ids = sorted({str(c["customer_id"]) for c in hits})
+    return (ids[0] if len(ids) == 1 else None), hits
 
 
 # ---- mirror / portal loading ----------------------------------------------
@@ -305,6 +356,31 @@ def _device_sns(client: SajClient, plant_uid: str) -> tuple[list[str], str]:
     return sns, "portal"
 
 
+def last_seen(latest: dict | None) -> dict | None:
+    """How old a device's newest stored reading is.
+
+    This is the answer to "0 rows — is that synced or not?". A successful fetch
+    that writes nothing looks identical to a fetch that did nothing, unless we
+    say when the device last reported. Readings are stored as true UTC instants;
+    MYT is what people here read clocks in, so report both.
+    """
+    ts = (latest or {}).get("ts")
+    if not ts:
+        return None
+    if isinstance(ts, str):
+        try:
+            ts = dt.datetime.fromisoformat(ts)
+        except ValueError:
+            return {"last_ts": str(ts)}
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    myt = ts.astimezone(dt.timezone(dt.timedelta(hours=8)))
+    hours = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds() / 3600
+    return {"last_ts": ts.isoformat(),
+            "last_myt": myt.strftime("%Y-%m-%d %H:%M"),
+            "hours_stale": round(hours, 1)}
+
+
 # ---- the run ---------------------------------------------------------------
 def run(client: SajClient, *, customer: str | None = None, plant: str | None = None,
         customer_id: str | None = None, plant_uid: str | None = None,
@@ -419,22 +495,29 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
             cid = str(p.get("customer_id") or "") or None
             linked_now = False
             if link and cid is None:
-                # *Finding* a plant may be loose, but *writing* a customer edge
-                # stays strict: an exact name match is the only evidence this
-                # project links on, and a wrong link costs far more than none.
-                cid = customer_for_name(p.get("plant_name"), customers)
+                cid, hits = customer_for_plant(p.get("plant_name"), customers)
                 if cid and link_plants([(uid, cid)]):
                     linked_now = True
-                    log.info(f"linked plant {uid} -> customer {cid}")
+                    who = next((h.get("name") for h in hits
+                                if str(h["customer_id"]) == cid), cid)
+                    log.info(f"linked plant {uid} -> customer {cid} ({who!r})")
                 elif cid:
                     cid = None  # refused: no such customer, or already set
                     log.debug(f"  plant {uid}: link refused by the db guard")
+                elif hits:
+                    names = ", ".join(f"{h.get('name')} ({h['customer_id']})"
+                                      for h in hits[:4])
+                    log.warn(f"plant {uid} not linked: {len(hits)} customer "
+                             f"records share that name — {names}")
                 else:
-                    log.debug(f"  plant {uid}: unlinked, no exact customer-name "
-                              "match — readings only")
+                    log.debug(f"  plant {uid}: no customer name leads this plant "
+                              "name — readings only")
             if link and cid and sns:
+                # Record how the edge was established, so a prefix-derived link
+                # is auditable separately from the nightly exact matches.
+                method = MATCH_METHOD_PREFIX if linked_now else MATCH_METHOD
                 mapped = insert_device_maps(
-                    [(cid, sn, uid, MATCH_METHOD, MATCH_CONFIDENCE, False)
+                    [(cid, sn, uid, method, MATCH_CONFIDENCE, False)
                      for sn in sns])
                 log.debug(f"  plant {uid}: {mapped} new device map(s)")
             targets.append({"plant_uid": uid, "plant_name": p.get("plant_name"),
@@ -448,6 +531,7 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
 
     written: dict[str, int] = defaultdict(int)
     errors: list[dict] = []
+    quiet: list[dict] = []          # fetched fine, but the device had nothing
     ok = 0
     with log.step("readings"):
         for i, (uid, sn) in enumerate(jobs):
@@ -458,6 +542,18 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
                 ok += 1
                 log.debug(f"  {sn}: {res['rows_written']} rows "
                           f"({res['source']}) in {time.time() - t_dev:.1f}s")
+                if not res["rows_written"]:
+                    # Say *why* it is zero, or "0 rows, ok" reads as "nothing
+                    # happened" when it means "asked, and there was nothing".
+                    seen = last_seen(res.get("latest"))
+                    quiet.append({"device_sn": sn, "plant_uid": uid, **(seen or {})})
+                    if seen and seen.get("hours_stale") is not None:
+                        log.warn(f"{sn}: synced, but SAJ had no readings for this "
+                                 f"day — last reported {seen['last_myt']} MYT, "
+                                 f"{seen['hours_stale']}h ago (device offline)")
+                    else:
+                        log.warn(f"{sn}: synced, but SAJ had no readings and we "
+                                 "hold none either — this device has never reported")
             except Exception as e:  # noqa: BLE001 — one bad inverter, not the run
                 errors.append({"device_sn": sn, "plant_uid": uid,
                                "error": f"{type(e).__name__}: {e}"[:300]})
@@ -484,6 +580,7 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
         "ok": ok,
         "err": len(errors),
         "errors": errors[:10],
+        "no_data": quiet,
         "elapsed_s": round(log.elapsed(), 1),
         "debug": {
             "db_backend": pg.backend(),
@@ -495,7 +592,8 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
         "log": log.lines,
     }
     log.info(f"DONE plants={len(targets)} devices={len(jobs)} ok={ok} "
-             f"err={len(errors)} rows={summary['rows_written']} "
+             f"err={len(errors)} no_data={len(quiet)} "
+             f"rows={summary['rows_written']} "
              f"saj_calls={summary['debug']['saj_calls']} "
              f"in {summary['elapsed_s']}s")
     summary["log"] = log.lines  # include the DONE line

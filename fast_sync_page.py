@@ -47,6 +47,7 @@ PAGE = """<!doctype html>
   .s-ok{background:rgba(46,160,67,.18);color:var(--ok)}
   .s-ambiguous{background:rgba(210,153,34,.18);color:var(--warn)}
   .s-error{background:rgba(248,81,73,.18);color:var(--bad)}
+  .s-nodata{background:rgba(210,153,34,.18);color:var(--warn)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:14px;
         margin-top:14px}
   .k{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
@@ -108,6 +109,7 @@ PAGE = """<!doctype html>
       <div><div class="k">Devices</div><div class="v" id="devices">-</div></div>
       <div><div class="k">Rows</div><div class="v" id="rows">-</div></div>
       <div><div class="k">SAJ calls</div><div class="v" id="saj">-</div></div>
+      <div><div class="k">No data</div><div class="v" id="nodata">-</div></div>
       <div><div class="k">Failed</div><div class="v" id="failed">-</div></div>
       <div><div class="k">Elapsed</div><div class="v" id="elapsed">-</div></div>
     </div>
@@ -122,6 +124,15 @@ PAGE = """<!doctype html>
 
   <div class="card" id="plantcard" style="display:none">
     <h2>Plants synced</h2><table id="planttab"></table>
+  </div>
+
+  <div class="card" id="quietcard" style="display:none">
+    <h2>Synced, but the inverter had nothing to give</h2>
+    <div class="note" style="margin:0 0 10px">These were fetched successfully &mdash;
+      SAJ simply held no readings for the day. The last time each one reported is
+      below; a gap of more than a few hours during daylight means it is offline,
+      not that the sync failed.</div>
+    <table id="quiettab"></table>
   </div>
 
   <div class="card" id="errcard" style="display:none">
@@ -209,6 +220,7 @@ function renderChoices(choices){
 // queue against each other.
 async function goMany(choices){
   const totals = {plants:0, devices:0, rows:0, saj:0, failed:0, secs:0};
+  const quiet = [];
   const log = [];
   $('msg').textContent = '';
   $('run').disabled = true;
@@ -228,6 +240,7 @@ async function goMany(choices){
         totals.rows += j.rows_written; totals.failed += j.err;
         totals.saj += (j.debug && j.debug.saj_calls) || 0;
         totals.secs += j.elapsed_s || 0;
+        quiet.push(...(j.no_data || []));
         log.push(...(j.log || []));
       } else {
         const d = (j && j.detail) || {};
@@ -236,7 +249,8 @@ async function goMany(choices){
       }
     }catch(e){ totals.failed++; log.push('[  0.00s] warn  ' + String(e)); }
   }
-  setState(totals.failed ? 'error' : 'ok');
+  setState(totals.failed ? 'error'
+           : (totals.devices && !totals.rows) ? 'nodata' : 'ok');
   $('matched').textContent = choices.length + ' plants requested';
   $('plants').textContent  = nf(totals.plants);
   $('devices').textContent = nf(totals.devices);
@@ -244,6 +258,7 @@ async function goMany(choices){
   $('saj').textContent     = nf(totals.saj);
   $('failed').textContent  = nf(totals.failed);
   $('elapsed').textContent = totals.secs.toFixed(1) + 's';
+  renderQuiet(quiet);
   renderLog(log);
   $('run').disabled = false;
   recent();
@@ -252,12 +267,25 @@ async function goMany(choices){
 // A failed run must not leave the previous run's numbers on screen — "ambiguous,
 // nothing synced" sitting above "129 rows" reads as if something was synced.
 function clearSummary(){
-  ['plants','devices','rows','saj','failed','elapsed']
+  ['plants','devices','rows','saj','nodata','failed','elapsed']
     .forEach(k => $(k).textContent = '-');
   $('matched').textContent = '';
   $('plantcard').style.display = 'none';
+  $('quietcard').style.display = 'none';
   $('errcard').style.display = 'none';
   renderLog([]);
+}
+
+// "0 rows, ok" and "nothing happened" must not look the same. If every device
+// came back empty, say so in the badge rather than a green OK.
+function renderQuiet(quiet){
+  $('nodata').textContent = nf((quiet || []).length);
+  $('quietcard').style.display = (quiet && quiet.length) ? '' : 'none';
+  $('quiettab').innerHTML = (quiet || []).map(q =>
+    '<tr><td class="mono">' + esc(q.device_sn) + '</td><td>' +
+    (q.last_myt ? 'last reported ' + esc(q.last_myt) + ' MYT · ' +
+                  esc(q.hours_stale) + 'h ago'
+                : 'never reported') + '</td></tr>').join('');
 }
 
 function showSummary(j){
@@ -269,6 +297,7 @@ function showSummary(j){
   $('elapsed').textContent = (j.elapsed_s ?? '-') + 's';
   $('matched').textContent = j.target
     ? j.target.kind + ' → ' + (j.target.matched ?? '') : '';
+  renderQuiet(j.no_data);
 
   const ps = j.plants || [];
   $('plantcard').style.display = ps.length ? '' : 'none';
@@ -311,7 +340,7 @@ async function go(override){
       {method:'POST', headers:{'X-Trigger-Token': tok.value}});
     const j = await r.json();
     if (r.ok){
-      setState('ok');
+      setState(j.device_count && !j.rows_written ? 'nodata' : 'ok');
       showSummary(j);
       renderLog(j.log);
     } else {

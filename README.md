@@ -151,12 +151,27 @@ What it does, in order:
 2. **Falls back to the live portal plant list** for a name the catalog has never
    seen, and writes what it finds into `saj_plant`, so the next run is fast.
    A customer with no linked plant falls back to plants carrying their name.
-3. **Repairs the customer edge** using the same conservative exact-name rule as
-   `sync_customer_plants` — an unlinked plant matching exactly one customer gets
-   linked and its devices mapped, so "sync this customer" doesn't quietly sync
-   nothing for a customer nobody has linked yet. Finding a plant may be loose,
-   but *writing* a link never is: a substring hit syncs the readings and leaves
-   the link alone. `--no-link` skips step 3 entirely.
+3. **Repairs the customer edge.** An unlinked plant is linked to the customer
+   whose name *leads* it, because that is how the names are actually built:
+
+   | customer | plant |
+   |---|---|
+   | `CHAN CHENG FATT (ATAP)` | `Chan Cheng Fatt` |
+   | `JCLANDS CAPITAL SDN.BHD.` | `JClands capital SDN BHD (Restaurant) - SELCO` |
+   | `JCLANDS CAPITAL SDN.BHD.` | `JClands capital SDN BHD (Petrol Station)-SELCO` |
+
+   One name must **completely lead** the other by at least **two words**. Both
+   halves stop real mislinks: a partial run of words is two people sharing a
+   surname (`Chan Cheng Fatt` vs `Chan Cheng Zhu`), and a one-word customer
+   (`Tee`) leads everyone called Tee. The longest lead wins so a specific record
+   beats a generic stem, and an identical name breaks a tie. Several customer
+   records sharing the winning name means your customer table has duplicates —
+   those are logged and **skipped**, never guessed at. Links written this way are
+   recorded as `match_method = name_prefix`, so they stay auditable separately
+   from the nightly sync's `name_exact`. `--no-link` skips step 3 entirely.
+
+   Measured against the current fleet (379 unlinked plants): **232 link, 94 hit
+   duplicate customer records, 53 have no customer that leads them.**
 4. **Pulls readings** for each device, rate-throttled the same as the sweep. One
    failing inverter is reported, never fatal.
 

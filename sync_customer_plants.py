@@ -26,6 +26,10 @@ from saj_api import SajClient
 
 
 MATCH_METHOD = "name_exact"
+# Written by fast_sync when a customer name *leads* a plant name rather than
+# equalling it — kept distinct so these are auditable separately from the
+# nightly sync's exact matches.
+MATCH_METHOD_PREFIX = "name_prefix"
 MATCH_CONFIDENCE = 0.9
 
 

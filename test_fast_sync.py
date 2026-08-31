@@ -86,16 +86,58 @@ class SelectByNameTests(unittest.TestCase):
             fast_sync.select_by_name(CUSTOMERS, "name", "   ")
 
 
-class CustomerForNameTests(unittest.TestCase):
-    def test_single_exact_customer(self):
-        self.assertEqual(fast_sync.customer_for_name("ah-seng", CUSTOMERS), "C1")
+class CustomerForPlantTests(unittest.TestCase):
+    """The rule that decides whether a link is written. Real names throughout."""
 
-    def test_duplicate_names_refuse_to_guess(self):
-        dupes = CUSTOMERS + [{"customer_id": "C9", "name": "Ah Seng"}]
-        self.assertIsNone(fast_sync.customer_for_name("Ah Seng", dupes))
+    JCLANDS = [
+        {"customer_id": "J0", "name": "JCLANDS CAPITAL SDN.BHD."},
+        {"customer_id": "J1", "name": "JCLANDS CAPITAL SDN. BHD (R-01) (SELCO)"
+                                      "(COMMERCIAL - PETROL STATION) "},
+        {"customer_id": "J2", "name": "JCLANDS CAPITAL SDN. BHD (PTD 219083) "
+                                      "(SELCO) (COMMERCIAL - PETROL STATION)"},
+    ]
 
-    def test_no_match_is_none(self):
-        self.assertIsNone(fast_sync.customer_for_name("Nobody", CUSTOMERS))
+    def test_one_customer_owns_several_differently_named_plants(self):
+        for site in ["JClands capital SDN BHD (Restaurant) - SELCO",
+                     "JClands capital SDN BHD (Petrol Station)-SELCO"]:
+            cid, _ = fast_sync.customer_for_plant(site, self.JCLANDS)
+            self.assertEqual(cid, "J0", site)
+
+    def test_a_customer_suffix_leads_the_other_way(self):
+        # Customer carries "(ATAP)", plant does not.
+        cs = [{"customer_id": "C1", "name": "CHAN CHENG FATT (ATAP)"}]
+        self.assertEqual(fast_sync.customer_for_plant("Chan Cheng Fatt", cs)[0], "C1")
+
+    def test_a_one_word_customer_is_never_evidence(self):
+        # "Tee" leads "Tee Bong Tsong" but is not the same person.
+        cs = [{"customer_id": "C1", "name": "Tee"}]
+        self.assertEqual(fast_sync.customer_for_plant("Tee Bong Tsong", cs),
+                         (None, []))
+
+    def test_a_partial_run_of_words_is_not_a_prefix(self):
+        # "Chan Cheng Fatt" vs "Chan Cheng Zhu" share two words and are two people.
+        cs = [{"customer_id": "C1", "name": "Chan Cheng Fatt"}]
+        self.assertEqual(fast_sync.customer_for_plant("Chan Cheng Zhu", cs),
+                         (None, []))
+
+    def test_an_exact_name_breaks_a_tie_against_a_longer_record(self):
+        # Plant "Ah Seng" leads "Ah Seng Trading" exactly as far as it leads
+        # "Ah Seng"; the identical name is the better answer.
+        cs = [{"customer_id": "C1", "name": "Ah Seng"},
+              {"customer_id": "C2", "name": "Ah Seng Trading"}]
+        self.assertEqual(fast_sync.customer_for_plant("Ah Seng", cs)[0], "C1")
+
+    def test_the_longest_lead_wins_over_a_generic_record(self):
+        cs = [{"customer_id": "C1", "name": "Tan Soon"},
+              {"customer_id": "C2", "name": "Tan Soon Keng (ATAP)"}]
+        self.assertEqual(fast_sync.customer_for_plant("Tan Soon Keng", cs)[0], "C2")
+
+    def test_duplicate_customer_records_refuse_to_guess(self):
+        cs = [{"customer_id": "C1", "name": "FOO MUN YOKE"},
+              {"customer_id": "C2", "name": "Foo Mun Yoke"}]
+        cid, hits = fast_sync.customer_for_plant("Foo Mun Yoke", cs)
+        self.assertIsNone(cid)
+        self.assertEqual(len(hits), 2)   # surfaced for a human, not picked
 
 
 class FindPlantsTests(unittest.TestCase):
@@ -173,6 +215,15 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["device_count"], 2)
         self.assertEqual(self.fetched, [("D3", 7), ("D4", 7)])
 
+    def test_an_unlinked_company_site_is_linked_to_its_customer(self):
+        plants = [{"plant_uid": "J9", "customer_id": None,
+                   "plant_name": "JClands capital SDN BHD (Restaurant) - SELCO"}]
+        customers = [{"customer_id": "J0", "name": "JCLANDS CAPITAL SDN.BHD."}]
+        with patch.object(fast_sync, "load_plants", return_value=plants),                 patch.object(fast_sync, "load_customers", return_value=customers):
+            out = self._run({"J9": ["D9"]}, customer="JCLANDS CAPITAL SDN.BHD.")
+        self.assertTrue(out["plants"][0]["linked_now"])
+        self.assertEqual(out["plants"][0]["customer_id"], "J0")
+
     def test_unlinked_plant_is_linked_to_the_customer_of_the_same_name(self):
         plants = [{"plant_uid": "P5", "plant_name": "Lim Solar", "customer_id": None}]
         with patch.object(fast_sync, "load_plants", return_value=plants):
@@ -196,29 +247,26 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["plants"][0]["customer_id"], "C1")
         self.assertTrue(out["plants"][0]["linked_now"])
 
-    def test_a_loose_plant_match_syncs_but_refuses_to_write_a_link(self):
-        # Searching by PLANT is allowed to be loose — the caller typed that name.
-        # "Ah Seng" reaches "Ah Seng Solar", but only an exact match may link.
-        plants = [{"plant_uid": "P7", "plant_name": "Ah Seng Solar",
+    def test_a_plant_no_customer_name_leads_syncs_without_a_link(self):
+        plants = [{"plant_uid": "P7", "plant_name": "Somewhere Else Entirely",
                    "customer_id": None}]
         with patch.object(fast_sync, "load_plants", return_value=plants):
-            out = self._run({"P7": ["D7"]}, plant="Ah Seng")
+            out = self._run({"P7": ["D7"]}, plant="Somewhere Else Entirely")
         self.assertEqual(out["device_count"], 1)          # readings still synced
         self.assertFalse(out["plants"][0]["linked_now"])  # but no link written
         self.assertIsNone(out["plants"][0]["customer_id"])
         fast_sync.link_plants.assert_not_called()
 
-    def test_an_unlinked_customer_reaches_its_suffixed_plant_but_writes_no_link(self):
-        # "Ah Seng" -> "Ah Seng Solar" is the same prefix shape as the JCLANDS
-        # sites, so it must sync. Linking stays strict, so no edge is written.
+    def test_an_unlinked_customer_reaches_and_links_its_suffixed_plant(self):
+        # "Ah Seng" -> "Ah Seng Solar" is the JCLANDS shape: the customer name
+        # leads the plant name, so it both syncs and links.
         plants = [{"plant_uid": "P7", "plant_name": "Ah Seng Solar",
                    "customer_id": None}]
         with patch.object(fast_sync, "load_plants", return_value=plants):
             out = self._run({"P7": ["D7"]}, customer="Ah Seng")
         self.assertEqual(out["device_count"], 1)
-        self.assertFalse(out["plants"][0]["linked_now"])
-        self.assertIsNone(out["plants"][0]["customer_id"])
-        fast_sync.link_plants.assert_not_called()
+        self.assertTrue(out["plants"][0]["linked_now"])
+        self.assertEqual(out["plants"][0]["customer_id"], "C1")
 
     def test_refresh_keeps_a_linked_plant_that_was_renamed(self):
         # The plant was linked as "Ah Seng" and has since been renamed in the
@@ -351,6 +399,42 @@ class RunTests(unittest.TestCase):
                               log=fast_sync.RunLog(echo=False))
         self.assertEqual([c["customer_id"] for c in ctx.exception.choices],
                          ["C1", "C2"])
+
+    def test_a_silent_inverter_is_reported_as_synced_with_no_data(self):
+        # "0 rows, ok=1" is indistinguishable from "nothing happened" unless the
+        # run says when the device last reported. Real case: the JCLANDS
+        # restaurant inverter went offline the previous afternoon.
+        stale = "2026-08-30T05:50:00+00:00"
+
+        def empty(client, sn, days=1):
+            return {"rows_written": 0, "source": "live",
+                    "latest": {"ts": stale, "ac_power_w": 0}}
+
+        with patch.object(fast_sync, "_device_sns",
+                          side_effect=lambda c, uid: (["D1"], "catalog")),                 patch.object(fast_sync.fetcher, "fetch_device", side_effect=empty):
+            out = fast_sync.run(self.client, customer="Ah Seng", interval=0,
+                                jitter=0, log=fast_sync.RunLog(echo=False))
+        self.assertEqual((out["ok"], out["err"], out["rows_written"]), (1, 0, 0))
+        quiet = out["no_data"]
+        self.assertEqual(quiet[0]["device_sn"], "D1")
+        self.assertEqual(quiet[0]["last_myt"], "2026-08-30 13:50")   # +08:00
+        self.assertGreater(quiet[0]["hours_stale"], 0)
+        self.assertTrue(any("device offline" in l for l in out["log"]))
+
+    def test_a_device_that_never_reported_says_so(self):
+        def empty(client, sn, days=1):
+            return {"rows_written": 0, "source": "live", "latest": None}
+
+        with patch.object(fast_sync, "_device_sns",
+                          side_effect=lambda c, uid: (["D1"], "catalog")),                 patch.object(fast_sync.fetcher, "fetch_device", side_effect=empty):
+            out = fast_sync.run(self.client, customer="Ah Seng", interval=0,
+                                jitter=0, log=fast_sync.RunLog(echo=False))
+        self.assertEqual(out["no_data"][0], {"device_sn": "D1", "plant_uid": "P1"})
+        self.assertTrue(any("never reported" in l for l in out["log"]))
+
+    def test_a_device_with_rows_is_not_listed_as_quiet(self):
+        out = self._run({"P1": ["D1"]}, customer="Ah Seng")
+        self.assertEqual(out["no_data"], [])
 
     def test_both_targets_is_a_usage_error(self):
         for kwargs in ({}, {"customer": "A", "plant": "B"},
