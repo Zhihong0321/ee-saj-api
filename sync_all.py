@@ -34,7 +34,21 @@ import random
 import pg
 import fetcher
 import fast_sync
+import accounts
 from saj_api import SajClient
+
+
+def _make_client() -> SajClient:
+    """Portal client for the primary DB account, with an env-var fallback so an
+    older deploy (or a fresh DB) still runs."""
+    acct = accounts.get_primary()
+    if acct:
+        return SajClient(username=acct["username"], password=acct["password"],
+                         org_code=acct.get("org_code") or "OAhz")
+    user, pw = os.environ.get("SAJ_USER"), os.environ.get("SAJ_PASS")
+    if user and pw:
+        return SajClient(username=user, password=pw)
+    raise SystemExit("no primary SAJ account configured (add one at /accounts)")
 
 REQ_INTERVAL = float(os.environ.get("SAJ_REQ_INTERVAL", "1.0"))
 JITTER = float(os.environ.get("SAJ_REQ_JITTER", "0.3"))
@@ -67,12 +81,7 @@ def _parse_args():
 
 def main():
     args = _parse_args()
-    user = os.environ.get("SAJ_USER")
-    pw = os.environ.get("SAJ_PASS")
-    if not (user and pw):
-        raise SystemExit("SAJ_USER / SAJ_PASS not set")
-
-    client = SajClient(username=user, password=pw)
+    client = _make_client()
 
     if args.customer or args.plant:
         try:

@@ -57,6 +57,23 @@ PASSWORD = os.environ.get("BACKFILL_PASS") or os.environ.get("SAJ_PASS")
 REQ_INTERVAL = float(os.environ.get("BACKFILL_REQ_INTERVAL", "0.05"))
 CLAIM_TTL_MIN = 15
 
+
+def _pool() -> list[dict]:
+    """The backfill account pool: every active account in the DB, each with its
+    own password. Falls back to the BACKFILL_USERS/BACKFILL_PASS env vars only
+    when the DB has no accounts yet (fresh deploy)."""
+    try:
+        import accounts
+        p = accounts.get_pool()
+        if p:
+            return p
+    except Exception:  # noqa: BLE001 — env fallback below
+        pass
+    if PASSWORD and USERS:
+        return [{"username": u, "password": PASSWORD, "org_code": "OAhz"}
+                for u in USERS]
+    return []
+
 # pg keeps one module-level connection; serialise our worker threads on it.
 _db_lock = threading.Lock()
 _stop = threading.Event()
@@ -228,9 +245,9 @@ def _as_date(v) -> dt.date | None:
     return v if isinstance(v, dt.date) else dt.date.fromisoformat(str(v)[:10])
 
 
-def _worker(worker: str, user: str, win_start: dt.date, win_end: dt.date):
+def _worker(worker: str, user: str, password: str, win_start: dt.date, win_end: dt.date):
     try:
-        client = SajClient(username=user, password=PASSWORD)
+        client = SajClient(username=user, password=password)
     except Exception as e:  # noqa: BLE001
         print(f"[backfill:{worker}] client init failed: {e}", flush=True)
         return
@@ -331,8 +348,8 @@ def start(window_start: str | None = None) -> dict:
 
 
 def _start(window_start: str | None = None) -> dict:
-    if not PASSWORD:
-        raise RuntimeError("BACKFILL_PASS / SAJ_PASS not set")
+    if not _pool():
+        raise RuntimeError("no active SAJ accounts configured (add one at /accounts)")
     ensure_schema()
     j = job()
     if j and j["state"] in ("syncing", "running", "stopping") and _alive():
@@ -358,14 +375,14 @@ def _start(window_start: str | None = None) -> dict:
             "sync_device_maps=0, sync_unmatched=0, sync_ambiguous=0, sync_conflicts=0, "
             "sync_error=null, sync_started_at=now(), sync_finished_at=null, "
             "updated_at=now() where id=1",
-            [ws.isoformat(), we.isoformat(), len(USERS)])
+            [ws.isoformat(), we.isoformat(), len(_pool())])
     else:
         _db("insert into saj_backfill_job "
             "(id,state,window_start,window_end,workers,started_at,message,"
             "sync_state,sync_started_at) "
             "values (1,'syncing',$1,$2,$3,now(),"
             "'syncing SAJ plants, devices, and customers','running',now())",
-            [ws.isoformat(), we.isoformat(), len(USERS)])
+            [ws.isoformat(), we.isoformat(), len(_pool())])
 
     try:
         synced = _sync_catalog()
@@ -415,7 +432,7 @@ def _start(window_start: str | None = None) -> dict:
             [we.isoformat()])
         _db("update saj_backfill_job set state='running', window_start=$1, window_end=$2, "
             "workers=$3, stopped_at=null, message=$4, updated_at=now() where id=1",
-            [ws.isoformat(), we.isoformat(), len(USERS),
+            [ws.isoformat(), we.isoformat(), len(_pool()),
              f"{sync_message}; {seeded} new devices queued"])
     except Exception as e:  # noqa: BLE001
         msg = f"backfill preparation failed after catalog sync: {e}"[:400]
@@ -424,10 +441,12 @@ def _start(window_start: str | None = None) -> dict:
 
     with _threads_lock:
         _threads.clear()
-        for i, user in enumerate(USERS):
+        for i, acct in enumerate(_pool()):
             name = f"w{i + 1}"
-            t = threading.Thread(target=_worker, args=(name, user, ws, we),
-                                 name=f"backfill-{name}", daemon=True)
+            t = threading.Thread(
+                target=_worker,
+                args=(name, acct["username"], acct["password"], ws, we),
+                name=f"backfill-{name}", daemon=True)
             _threads.append(t)
     for t in _threads:
         t.start()
@@ -515,11 +534,11 @@ def status() -> dict:
         "sync_error": (j or {}).get("sync_error"),
         "policy_months": POLICY_MONTHS,
         "policy_floor": policy_floor().isoformat(),
-        "workers_configured": len(USERS),
+        "workers_configured": len(_pool()),
         "workers_alive": sum(1 for t in _threads if t.is_alive()),
         "worker_now": dict(_worker_now),
         "elapsed_seconds": int(elapsed) if elapsed else None,
-        "accounts": USERS,
+        "accounts": [a["username"] for a in _pool()],
     }
 
 

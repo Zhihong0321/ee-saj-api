@@ -621,8 +621,17 @@ def main() -> int:
                         help="print only the summary JSON, no live log")
     args = parser.parse_args()
 
-    user, pw = os.environ.get("SAJ_USER"), os.environ.get("SAJ_PASS")
-    client = SajClient(username=user, password=pw) if user and pw else SajClient()
+    try:
+        import accounts
+        acct = accounts.get_primary()
+    except Exception:  # noqa: BLE001 — fall back to env if the DB is unreachable
+        acct = None
+    if acct:
+        client = SajClient(username=acct["username"], password=acct["password"],
+                           org_code=acct.get("org_code") or "OAhz")
+    else:
+        user, pw = os.environ.get("SAJ_USER"), os.environ.get("SAJ_PASS")
+        client = SajClient(username=user, password=pw) if user and pw else SajClient()
     # Shared with run() so a failed resolution still has its narration to print.
     log = RunLog(debug=not args.quiet, echo=not args.json)
     try:

@@ -38,7 +38,7 @@ import random
 import threading
 import datetime as dt
 
-from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi import FastAPI, HTTPException, Header, Query, Body
 from fastapi.responses import HTMLResponse
 
 import fetcher
@@ -47,12 +47,12 @@ import r2
 import backfill
 import fast_sync
 import retention
+import accounts
 from backfill_page import PAGE as BACKFILL_PAGE
 from fast_sync_page import PAGE as FAST_SYNC_PAGE
+from accounts_page import PAGE as ACCOUNTS_PAGE
 from saj_api import SajClient, SajError
 
-SAJ_USER = os.environ.get("SAJ_USER")
-SAJ_PASS = os.environ.get("SAJ_PASS")
 TRIGGER_TOKEN = os.environ.get("TRIGGER_TOKEN")
 MAX_DAYS = int(os.environ.get("MAX_DAYS", "14"))
 # Wide window for the on-demand monthly backfill + reads (app-chosen, heavier).
@@ -68,12 +68,35 @@ _client: SajClient | None = None
 
 
 def _get_client() -> SajClient:
+    """The shared portal client, logged in as the DB-configured primary account."""
     global _client
     if _client is None:
-        if not (SAJ_USER and SAJ_PASS):
-            raise HTTPException(500, "SAJ_USER / SAJ_PASS env vars are not set")
-        _client = SajClient(username=SAJ_USER, password=SAJ_PASS)
+        acct = accounts.get_primary()
+        if not acct:
+            raise HTTPException(
+                500, "no primary SAJ account configured — add one at /accounts")
+        _client = SajClient(username=acct["username"], password=acct["password"],
+                            org_code=acct.get("org_code") or "OAhz")
     return _client
+
+
+def _reset_client() -> None:
+    """Drop the cached client so the next call re-reads credentials from the DB.
+
+    Called after any account edit — a rotated password or a new primary must take
+    effect on the very next portal call, not after a redeploy.
+    """
+    global _client
+    with _lock:
+        _client = None
+
+
+def _primary_username() -> str | None:
+    try:
+        acct = accounts.get_primary()
+        return acct["username"] if acct else None
+    except Exception:  # noqa: BLE001 — health must never 500 over this
+        return None
 
 
 def _check_auth(token: str | None):
@@ -92,12 +115,12 @@ def health():
         "deployment_id": os.environ.get("RAILWAY_DEPLOYMENT_ID"),
         "environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME"),
         "db_backend": pg.backend(),
-        "saj_account": SAJ_USER,
+        "saj_account": _primary_username(),
         "protected": bool(TRIGGER_TOKEN),
         "visit_fresh_seconds": VISIT_FRESH_SECONDS,
         "r2_image_mirror": r2.enabled(),
         "pages": {"fast_sync": "/fast", "backfill": "/backfill",
-                  "agent": "/agent", "api_docs": "/docs"},
+                  "accounts": "/accounts", "agent": "/agent", "api_docs": "/docs"},
         "time": dt.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -435,7 +458,7 @@ def sync_fast(
         raise HTTPException(502, {"error": "saj", "err_code": e.err_code,
                                   "detail": e.err_msg, "log": log.lines})
     except HTTPException:
-        raise  # already shaped (e.g. the 500 for unset SAJ_USER) — don't re-wrap
+        raise  # already shaped (e.g. the 500 for no primary account) — don't re-wrap
     except Exception as e:  # noqa: BLE001 — a prod test deserves the log, not a 500
         log.warn(f"unhandled {type(e).__name__}: {e}")
         raise HTTPException(500, {"error": type(e).__name__, "detail": str(e),
@@ -447,6 +470,85 @@ def sync_fast(
 def fast_sync_page():
     """Browser control page for the fast sync — the endpoint is curl-only otherwise."""
     return HTMLResponse(FAST_SYNC_PAGE)
+
+
+# ---- SAJ account management (DB-backed; replaces SAJ_USER/SAJ_PASS env) -----
+@app.get("/accounts", response_class=HTMLResponse)
+def accounts_page():
+    """Browser page to manage the SAJ portal logins the fetcher uses."""
+    return HTMLResponse(ACCOUNTS_PAGE)
+
+
+@app.get("/accounts/list")
+def accounts_list(token: str | None = Query(None),
+                  x_trigger_token: str | None = Header(None)):
+    _check_auth(token or x_trigger_token)
+    accounts.ensure_schema()
+    return {"accounts": accounts.list_accounts()}
+
+
+@app.post("/accounts/save")
+def accounts_save(body: dict = Body(...),
+                  token: str | None = Query(None),
+                  x_trigger_token: str | None = Header(None)):
+    """Add or update one account. Blank password on an existing account keeps it."""
+    _check_auth(token or x_trigger_token)
+    accounts.ensure_schema()
+    try:
+        res = accounts.upsert(
+            username=body.get("username"), password=body.get("password"),
+            org_code=body.get("org_code"), active=bool(body.get("active", True)),
+            is_primary=bool(body.get("is_primary", False)),
+            remarks=body.get("remarks"))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    _reset_client()
+    return {"ok": True, **res}
+
+
+@app.post("/accounts/primary")
+def accounts_primary(username: str = Query(...),
+                     token: str | None = Query(None),
+                     x_trigger_token: str | None = Header(None)):
+    _check_auth(token or x_trigger_token)
+    try:
+        accounts.set_primary(username)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    _reset_client()
+    return {"ok": True, "primary": username}
+
+
+@app.post("/accounts/active")
+def accounts_active(username: str = Query(...), active: bool = Query(...),
+                    token: str | None = Query(None),
+                    x_trigger_token: str | None = Header(None)):
+    _check_auth(token or x_trigger_token)
+    accounts.set_active(username, active)
+    _reset_client()
+    return {"ok": True, "username": username, "active": active}
+
+
+@app.post("/accounts/delete")
+def accounts_delete(username: str = Query(...),
+                    token: str | None = Query(None),
+                    x_trigger_token: str | None = Header(None)):
+    _check_auth(token or x_trigger_token)
+    accounts.delete(username)
+    _reset_client()
+    return {"ok": True, "deleted": username}
+
+
+@app.post("/accounts/test")
+def accounts_test(username: str = Query(...),
+                  token: str | None = Query(None),
+                  x_trigger_token: str | None = Header(None)):
+    """Log this account into the SAJ portal once and report success/failure."""
+    _check_auth(token or x_trigger_token)
+    try:
+        return accounts.test_login(username)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
 
 
 @app.get("/sync/fast/log")
@@ -584,6 +686,20 @@ async def agent_ask(
     except ImportError as e:  # noqa: BLE001
         raise HTTPException(501, f"agent not installed: {e}")
     return await ops_agent.ask(q, resume=session)
+
+
+@app.on_event("startup")
+def _seed_accounts():
+    """One-time migration off env vars: if saj_account is empty, copy the Railway
+    SAJ_USER/SAJ_PASS (+ BACKFILL_USERS) in so the first boot after this deploy
+    keeps working. After that, accounts live in the DB and are managed at
+    /accounts — the env vars become dead weight."""
+    try:
+        n = accounts.seed_from_env_if_empty()
+        if n:
+            print(f"[accounts] seeded {n} account(s) from env vars", flush=True)
+    except Exception as e:  # noqa: BLE001 — never block startup over seeding
+        print(f"[accounts] seed skipped: {e}", flush=True)
 
 
 @app.on_event("startup")
