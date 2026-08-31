@@ -19,7 +19,7 @@ function Assert-LastExitCode([string]$Step) {
 }
 
 Write-Host "[1/3] Compiling Python sources"
-& $python -m py_compile saj_api.py fetcher.py backfill.py main.py sync_all.py fast_sync.py sync_customer_plants.py prod_smoke.py test_saj_optimization.py test_prod_smoke.py test_fast_sync.py test_fast_sync_api.py
+& $python -m py_compile saj_api.py fetcher.py backfill.py main.py sync_all.py fast_sync.py fast_sync_page.py sync_customer_plants.py prod_smoke.py test_saj_optimization.py test_prod_smoke.py test_fast_sync.py test_fast_sync_api.py
 Assert-LastExitCode "Python compilation"
 
 Write-Host "[2/3] Running unit tests"

@@ -247,8 +247,33 @@ class RunTests(unittest.TestCase):
         self.assertTrue(any("start customer=" in line for line in log.lines))
         self.assertTrue(any("mirror:" in line for line in log.lines))
 
+    def test_a_customer_id_skips_name_matching_entirely(self):
+        # Three customers named "Chen" is real in prod; the id is the only way in.
+        dupes = CUSTOMERS + [{"customer_id": "C9", "name": "Ah Seng"}]
+        with patch.object(fast_sync, "load_customers", return_value=dupes):
+            out = self._run({"P1": ["D1"]}, customer_id="C1")
+        self.assertEqual(out["target"]["customer_id"], "C1")
+        self.assertEqual(out["target"]["by"], "id")
+        self.assertEqual(out["device_count"], 1)
+
+    def test_an_unknown_customer_id_is_not_found(self):
+        with self.assertRaises(fast_sync.TargetNotFound):
+            fast_sync.run(self.client, customer_id="nope",
+                          log=fast_sync.RunLog(echo=False))
+
+    def test_ambiguous_customers_carry_ids_to_choose_from(self):
+        dupes = [{"customer_id": "C1", "name": "Chen"},
+                 {"customer_id": "C2", "name": "Chen"}]
+        with patch.object(fast_sync, "load_customers", return_value=dupes):
+            with self.assertRaises(fast_sync.TargetAmbiguous) as ctx:
+                fast_sync.run(self.client, customer="Chen",
+                              log=fast_sync.RunLog(echo=False))
+        self.assertEqual([c["customer_id"] for c in ctx.exception.choices],
+                         ["C1", "C2"])
+
     def test_both_targets_is_a_usage_error(self):
-        for kwargs in ({}, {"customer": "A", "plant": "B"}):
+        for kwargs in ({}, {"customer": "A", "plant": "B"},
+                       {"customer": "A", "customer_id": "C1"}):
             with self.assertRaises(ValueError):
                 fast_sync.run(self.client, **kwargs)
 

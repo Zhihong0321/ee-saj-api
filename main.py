@@ -6,6 +6,7 @@ Trigger a fetch of the 5-min generation feed from the SAJ portal into prod
     POST /fetch/device/{device_sn}?days=1[&force=true]   one inverter
     POST /fetch/plant/{plant_uid}?days=1[&force=true]     every inverter in a plant
     POST /sync/fast?customer=NAME | ?plant=NAME           one named account, by name
+    GET  /fast                                            fast-sync control page (browser)
     GET  /sync/fast/log                                   recent fast syncs + debug log
     GET  /device/{device_sn}/latest                       confirm what landed
     GET  /backfill                                        one-time history copy UI
@@ -47,6 +48,7 @@ import backfill
 import fast_sync
 import retention
 from backfill_page import PAGE as BACKFILL_PAGE
+from fast_sync_page import PAGE as FAST_SYNC_PAGE
 from saj_api import SajClient, SajError
 
 SAJ_USER = os.environ.get("SAJ_USER")
@@ -94,6 +96,8 @@ def health():
         "protected": bool(TRIGGER_TOKEN),
         "visit_fresh_seconds": VISIT_FRESH_SECONDS,
         "r2_image_mirror": r2.enabled(),
+        "pages": {"fast_sync": "/fast", "backfill": "/backfill",
+                  "agent": "/agent", "api_docs": "/docs"},
         "time": dt.datetime.utcnow().isoformat() + "Z",
     }
 
@@ -381,6 +385,8 @@ def _remember_fast_run(summary: dict) -> None:
 def sync_fast(
     customer: str | None = Query(None, description="customer name to sync"),
     plant: str | None = Query(None, description="plant name to sync"),
+    customer_id: str | None = Query(None, description="exact customer id — the only "
+                                    "way to pick between customers sharing a name"),
     days: int = Query(1, ge=1, le=MAX_DAYS, description="days back to pull per device"),
     refresh_catalog: bool = Query(False, description="re-read the plant row from SAJ first"),
     debug: bool = Query(True, description="include the per-step debug log in the response"),
@@ -398,13 +404,15 @@ def sync_fast(
     go to the service log, and the last few runs stay at `/sync/fast/log`.
     """
     _check_auth(token or x_trigger_token)
-    if bool(customer) == bool(plant):
-        raise HTTPException(400, "give exactly one of ?customer= or ?plant=")
+    if sum(map(bool, (customer, plant, customer_id))) != 1:
+        raise HTTPException(
+            400, "give exactly one of ?customer=, ?customer_id= or ?plant=")
     log = fast_sync.RunLog(debug=debug)
     try:
         with _lock:
             client = _get_client()
-            out = fast_sync.run(client, customer=customer, plant=plant, days=days,
+            out = fast_sync.run(client, customer=customer, plant=plant,
+                                customer_id=customer_id, days=days,
                                 refresh_catalog=refresh_catalog, log=log)
         _remember_fast_run(out)
         return out
@@ -412,6 +420,7 @@ def sync_fast(
         log.warn(f"ambiguous: {e}")
         raise HTTPException(409, {"error": "ambiguous", "query": e.query,
                                   "candidates": e.candidates[:20],
+                                  "choices": e.choices[:20],
                                   "log": log.lines})
     except fast_sync.TargetNotFound as e:
         log.warn(f"not found: {e}")
@@ -421,10 +430,19 @@ def sync_fast(
         log.warn(f"SAJ error {e.err_code}: {e.err_msg}")
         raise HTTPException(502, {"error": "saj", "err_code": e.err_code,
                                   "detail": e.err_msg, "log": log.lines})
+    except HTTPException:
+        raise  # already shaped (e.g. the 500 for unset SAJ_USER) — don't re-wrap
     except Exception as e:  # noqa: BLE001 — a prod test deserves the log, not a 500
         log.warn(f"unhandled {type(e).__name__}: {e}")
         raise HTTPException(500, {"error": type(e).__name__, "detail": str(e),
                                   "log": log.lines})
+
+
+@app.get("/fast", response_class=HTMLResponse)
+@app.get("/sync/fast/page", response_class=HTMLResponse)
+def fast_sync_page():
+    """Browser control page for the fast sync — the endpoint is curl-only otherwise."""
+    return HTMLResponse(FAST_SYNC_PAGE)
 
 
 @app.get("/sync/fast/log")

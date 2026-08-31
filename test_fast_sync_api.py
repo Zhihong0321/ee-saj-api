@@ -76,6 +76,37 @@ class FastSyncEndpointTests(unittest.TestCase):
         self.assertEqual(detail["candidates"], ["Ah Seng", "Ah Seng Trading"])
         self.assertTrue(any("ambiguous" in line for line in detail["log"]))
 
+    def test_the_control_page_is_served(self):
+        for path in ("/fast", "/sync/fast/page"):
+            r = self.client.get(path)
+            self.assertEqual(r.status_code, 200, path)
+            self.assertIn("text/html", r.headers["content-type"])
+            self.assertIn("SAJ fast sync", r.text)
+
+    def test_a_customer_id_is_passed_straight_through(self):
+        with patch.object(main.fast_sync, "run", return_value=SUMMARY) as run:
+            r = self.client.post("/sync/fast?customer_id=C1")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(run.call_args.kwargs["customer_id"], "C1")
+
+    def test_ambiguity_returns_machine_usable_choices(self):
+        err = fast_sync.TargetAmbiguous(
+            "Chen", ["Chen (a)", "Chen (b)"],
+            [{"label": "Chen", "customer_id": "a"},
+             {"label": "Chen", "customer_id": "b"}])
+        with patch.object(main.fast_sync, "run", side_effect=err):
+            r = self.client.post("/sync/fast?customer=Chen")
+        # The page turns these into buttons; a shared name has no other way out.
+        self.assertEqual([c["customer_id"] for c in r.json()["detail"]["choices"]],
+                         ["a", "b"])
+
+    def test_a_deliberate_http_error_is_not_rewrapped(self):
+        with patch.object(main, "_get_client",
+                          side_effect=main.HTTPException(500, "creds missing")):
+            r = self.client.post("/sync/fast?customer=X")
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.json()["detail"], "creds missing")
+
     def test_an_unknown_name_returns_404_with_the_log(self):
         with patch.object(main.fast_sync, "run",
                           side_effect=fast_sync.TargetNotFound("no match for 'X'")):

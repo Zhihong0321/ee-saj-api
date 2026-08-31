@@ -107,14 +107,21 @@ class TargetNotFound(LookupError):
 
 
 class TargetAmbiguous(LookupError):
-    """The name matched several distinct records; the caller has to be specific."""
+    """The name matched several distinct records; the caller has to be specific.
 
-    def __init__(self, query: str, candidates: list[str]):
+    `candidates` reads well in a log line. `choices` is the machine-usable form:
+    each carries what to send back to pick it, which is the only way through when
+    several customers share a name outright and no spelling can separate them.
+    """
+
+    def __init__(self, query: str, candidates: list[str],
+                 choices: list[dict] | None = None):
         super().__init__(
             f"{query!r} matches {len(candidates)}: " + ", ".join(candidates[:10])
         )
         self.query = query
         self.candidates = candidates
+        self.choices = choices or [{"label": c} for c in candidates]
 
 
 # ---- name resolution (pure — no DB, no portal) ----------------------------
@@ -140,7 +147,8 @@ def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
         raise TargetNotFound(f"no match for {query!r}")
     names = sorted({(r.get(field) or "").strip() for r in loose})
     if len(names) > 1:
-        raise TargetAmbiguous(query, names)
+        raise TargetAmbiguous(query, names,
+                              [{"label": n, "name": n} for n in names])
     return loose
 
 
@@ -270,6 +278,7 @@ def _device_sns(client: SajClient, plant_uid: str) -> tuple[list[str], str]:
 
 # ---- the run ---------------------------------------------------------------
 def run(client: SajClient, *, customer: str | None = None, plant: str | None = None,
+        customer_id: str | None = None,
         days: int = 1, link: bool = True, refresh_catalog: bool = False,
         interval: float | None = None, jitter: float | None = None,
         debug: bool | None = None, echo: bool = True,
@@ -285,14 +294,16 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
     response. Pass a `log` to have a caller collect the narration of a run that
     raises — the resolution failures are the ones worth reading.
     """
-    if bool(customer) == bool(plant):
-        raise ValueError("give exactly one of customer= / plant=")
+    if sum(map(bool, (customer, plant, customer_id))) != 1:
+        raise ValueError("give exactly one of customer= / customer_id= / plant=")
     interval = REQ_INTERVAL if interval is None else interval
     jitter = JITTER if jitter is None else jitter
     log = log or RunLog(debug=DEBUG if debug is None else debug, echo=echo)
     calls0 = getattr(client, "calls", 0)
 
-    log.info(f"start {'customer' if customer else 'plant'}={customer or plant!r} "
+    kind = "plant" if plant else "customer"
+    query = customer or plant or customer_id
+    log.info(f"start {'customer_id' if customer_id else kind}={query!r} "
              f"days={days} link={link} refresh_catalog={refresh_catalog}")
     log.debug(f"db backend={pg.backend()} interval={interval}s jitter={jitter}s")
 
@@ -301,16 +312,26 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
         stored = load_plants()
     log.debug(f"mirror: customers={len(customers)} plants={len(stored)} "
               f"linked={sum(1 for p in stored if p.get('customer_id'))}")
-    customer_id: str | None = None
-
     with log.step("resolve"):
-        if customer:
-            matched = select_by_name(customers, "name", customer)
-            ids = sorted({str(r["customer_id"]) for r in matched})
-            if len(ids) != 1:
-                raise TargetAmbiguous(
-                    customer, [f"{r.get('name')} ({r['customer_id']})" for r in matched])
-            customer_id, matched_name = ids[0], matched[0].get("name")
+        if customer or customer_id:
+            if customer_id:
+                # Picked from an ambiguous result: the id is the only thing that
+                # separates several customers sharing one name.
+                matched = [c for c in customers
+                           if str(c["customer_id"]) == str(customer_id)]
+                if not matched:
+                    raise TargetNotFound(f"no customer with id {customer_id!r}")
+                customer_id, matched_name = str(customer_id), matched[0].get("name")
+            else:
+                matched = select_by_name(customers, "name", customer)
+                ids = sorted({str(r["customer_id"]) for r in matched})
+                if len(ids) != 1:
+                    raise TargetAmbiguous(
+                        customer,
+                        [f"{r.get('name')} ({r['customer_id']})" for r in matched],
+                        [{"label": r.get("name"),
+                          "customer_id": str(r["customer_id"])} for r in matched])
+                customer_id, matched_name = ids[0], matched[0].get("name")
             log.info(f"customer {matched_name!r} -> {customer_id}")
             plants = [p for p in stored
                       if str(p.get("customer_id") or "") == customer_id]
@@ -405,8 +426,9 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
         t["rows_written"] = written[t["plant_uid"]]
     summary = {
         "mode": "fast",
-        "target": {"kind": "customer" if customer else "plant",
-                   "query": customer or plant,
+        "target": {"kind": kind,
+                   "by": "id" if query == customer_id else "name",
+                   "query": query,
                    "matched": matched_name,
                    "customer_id": customer_id},
         "days": days,

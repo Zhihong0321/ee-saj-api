@@ -19,6 +19,7 @@ chart data for completed historical days, and upserts them into Postgres.
 | `POST` | `/fetch/plant/{plant_uid}?days=1` | **Main app call** — refresh the plant into prod, return chart-ready `series` + `daily` |
 | `POST` | `/fetch/device/{device_sn}?days=1` | Same for one inverter serial (adds `latest`) |
 | `POST` | `/sync/fast?customer=NAME` or `?plant=NAME` | **Fast sync** — resolve a name to its plants and sync just those |
+| `GET`  | `/fast` | **Fast-sync control page** — run it from the browser, no curl |
 | `GET`  | `/sync/fast/log?limit=5` | The last fast syncs this instance ran (in-memory debug log) |
 | `GET`  | `/plant/{plant_uid}/series?days=1` | Chart data straight from prod — no SAJ call, no token |
 | `GET`  | `/device/{device_sn}/series?days=1` | Same, one inverter |
@@ -114,6 +115,15 @@ Use the same `SAJ_USER`, `SAJ_PASS`, and `DATABASE_URL` as the deployed service.
 **name** instead of a UID and it syncs only the plants behind it. A one-plant
 customer takes seconds, versus the ~20 minute full sweep.
 
+**In the browser: [`/fast`](https://ee-saj-api-production.up.railway.app/fast).**
+Pick Customer or Plant, type the name, hit Sync — the run's stats and full log
+render on the page. When a name is ambiguous the candidates come back as buttons;
+clicking one syncs it, which is the only way through for the customers who share
+a name outright (three are literally named `Chen`). The token is remembered in
+`localStorage`, shared with the `/backfill` page.
+
+From a script instead:
+
 ```bash
 python fast_sync.py --customer "Ah Seng"          # or: python sync_all.py --customer "Ah Seng"
 python fast_sync.py --plant "Taman Molek" --days 7
@@ -151,6 +161,7 @@ naming an account is an explicit request for current data.
 | `--days N` / `&days=N` | days back per device (default 1 = today; capped by `MAX_DAYS` over HTTP) |
 | `--no-link` | pull readings only; leave the customer/plant links alone |
 | `--refresh-catalog` / `&refresh_catalog=true` | re-read the plant's name/owner/state from SAJ first (follows the plant UID, so a renamed plant is still found) |
+| `&customer_id=ID` | sync one exact customer — the only way to pick between customers sharing a name |
 
 Exit codes: `0` ok, `1` some devices failed, `2` ambiguous name, `3` no match.
 Over HTTP those last two are `409` and `404`.
