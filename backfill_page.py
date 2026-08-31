@@ -63,11 +63,15 @@ PAGE = """<!doctype html>
     <div class="row">
       <input id="token" type="password" placeholder="trigger token" autocomplete="off">
       <button id="start">Start</button>
+      <button id="redo">Re-pull all</button>
       <button id="stop">Stop</button>
     </div>
     <div id="msg" class="err"></div>
     <div class="note">Progress is saved after every device-day, so a redeploy or crash
-      loses at most one day of work.</div>
+      loses at most one day of work.
+      <b>Start</b> skips days already stored; <b>Re-pull all</b> fetches every day in
+      the window again and overwrites what is there &mdash; use it to repair history
+      that was stored wrong.</div>
   </div>
 
   <div class="card">
@@ -130,6 +134,11 @@ async function act(path){
   poll();
 }
 $('start').onclick = () => act('/backfill/start');
+$('redo').onclick  = () => {
+  if(confirm('Re-pull every day in the window from SAJ, overwriting what is stored?\\n'
+             + 'This is one SAJ call per device-day and takes hours.'))
+    act('/backfill/start?redo=true');
+};
 $('stop').onclick  = () => act('/backfill/stop');
 
 async function poll(){
@@ -139,7 +148,9 @@ async function poll(){
   const st = s.state || 'idle';
   const el = $('state'); el.textContent = st; el.className = 'state s'+'-'+st;
   $('window').textContent = s.window_start ? s.window_start+' \\u2192 '+s.window_end
-                                           + '  ('+s.span_days+'d)' : '';
+                                           + '  ('+s.span_days+'d)'
+                                           + (s.redo ? '  \\u2014 re-pulling every day' : '')
+                                         : '';
   $('policy').textContent = s.policy_months
     ? 'Policy: last '+s.policy_months+' months only \\u2014 nothing before '
       +s.policy_floor+' is captured.' : '';

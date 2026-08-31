@@ -582,12 +582,14 @@ def backfill_page():
 @app.post("/backfill/start")
 def backfill_start(
     window_start: str | None = Query(None, description="oldest day to copy (YYYY-MM-DD)"),
+    redo: bool = Query(False, description="re-pull every day from SAJ, including days "
+                                          "we already hold — repairs bad history"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
 ):
     _check_auth(token or x_trigger_token)
     try:
-        return backfill.start(window_start)
+        return backfill.start(window_start, redo=redo)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, str(e))
 

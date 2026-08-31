@@ -119,8 +119,10 @@ def ensure_schema():
              sync_error text,
              sync_started_at timestamptz,
              sync_finished_at timestamptz,
+             redo         boolean not null default false,
              updated_at   timestamptz not null default now())""")
     _db("""alter table saj_backfill_job
+             add column if not exists redo boolean not null default false,
              add column if not exists sync_state text not null default 'pending',
              add column if not exists sync_plants int not null default 0,
              add column if not exists sync_devices int not null default 0,
@@ -245,7 +247,8 @@ def _as_date(v) -> dt.date | None:
     return v if isinstance(v, dt.date) else dt.date.fromisoformat(str(v)[:10])
 
 
-def _worker(worker: str, user: str, password: str, win_start: dt.date, win_end: dt.date):
+def _worker(worker: str, user: str, password: str, win_start: dt.date, win_end: dt.date,
+            redo: bool = False):
     try:
         client = SajClient(username=user, password=password)
     except Exception as e:  # noqa: BLE001
@@ -267,11 +270,18 @@ def _worker(worker: str, user: str, password: str, win_start: dt.date, win_end: 
         day = _as_date(dev["cursor_day"]) or win_start
         days_done = dev["days_done"] or 0
         written = dev["rows_written"] or 0
-        try:
-            have = _existing_days(sn, day, win_end)
-        except Exception as e:  # noqa: BLE001
-            print(f"[backfill:{worker}] {sn} existing-days failed: {e}", flush=True)
+        if redo:
+            # Re-pull every day even though it already has rows: the stored copy
+            # can be wrong or incomplete (e.g. the daylight-cutoff trigger that
+            # discarded everything outside 06:00-18:00 MYT on insert). The upsert
+            # is keyed on (device_sn, ts), so re-pulling repairs in place.
             have = set()
+        else:
+            try:
+                have = _existing_days(sn, day, win_end)
+            except Exception as e:  # noqa: BLE001
+                print(f"[backfill:{worker}] {sn} existing-days failed: {e}", flush=True)
+                have = set()
 
         while day <= win_end and not _stop.is_set():
             _worker_now[worker] = f"{sn} {day}"
@@ -337,17 +347,28 @@ def _maybe_finish():
 
 
 # ---- control --------------------------------------------------------------
-def start(window_start: str | None = None) -> dict:
-    """Synchronize the catalog, then begin (or resume) the history copy."""
+def start(window_start: str | None = None, redo: bool = False,
+          resuming: bool = False) -> dict:
+    """Synchronize the catalog, then begin (or resume) the history copy.
+
+    `redo=True` re-pulls every day in the window from SAJ even when we already
+    hold rows for it, repairing history that was stored wrong. It costs a full
+    SAJ call per device-day, so it is opt-in.
+
+    `resuming` is set only by the startup auto-resume: it keeps the redo mode
+    but leaves each device's cursor alone, so a redeploy picks the sweep up
+    where it stopped instead of starting the whole window again.
+    """
     if not _start_lock.acquire(blocking=False):
         return {"status": "already_running", **status()}
     try:
-        return _start(window_start)
+        return _start(window_start, redo, resuming)
     finally:
         _start_lock.release()
 
 
-def _start(window_start: str | None = None) -> dict:
+def _start(window_start: str | None = None, redo: bool = False,
+           resuming: bool = False) -> dict:
     if not _pool():
         raise RuntimeError("no active SAJ accounts configured (add one at /accounts)")
     ensure_schema()
@@ -369,20 +390,20 @@ def _start(window_start: str | None = None) -> dict:
 
     if j:
         _db("update saj_backfill_job set state='syncing', window_start=$1, window_end=$2, "
-            "workers=$3, started_at=coalesce(started_at, now()), stopped_at=null, "
+            "workers=$3, redo=$4, started_at=coalesce(started_at, now()), stopped_at=null, "
             "message='syncing SAJ plants, devices, and customers', "
             "sync_state='running', sync_plants=0, sync_devices=0, sync_plant_links=0, "
             "sync_device_maps=0, sync_unmatched=0, sync_ambiguous=0, sync_conflicts=0, "
             "sync_error=null, sync_started_at=now(), sync_finished_at=null, "
             "updated_at=now() where id=1",
-            [ws.isoformat(), we.isoformat(), len(_pool())])
+            [ws.isoformat(), we.isoformat(), len(_pool()), redo])
     else:
         _db("insert into saj_backfill_job "
-            "(id,state,window_start,window_end,workers,started_at,message,"
+            "(id,state,window_start,window_end,workers,redo,started_at,message,"
             "sync_state,sync_started_at) "
-            "values (1,'syncing',$1,$2,$3,now(),"
+            "values (1,'syncing',$1,$2,$3,$4,now(),"
             "'syncing SAJ plants, devices, and customers','running',now())",
-            [ws.isoformat(), we.isoformat(), len(_pool())])
+            [ws.isoformat(), we.isoformat(), len(_pool()), redo])
 
     try:
         synced = _sync_catalog()
@@ -418,11 +439,12 @@ def _start(window_start: str | None = None) -> dict:
         # Widening the window backwards must re-open devices already marked done,
         # or the older days would never be visited. Days already in saj_reading are
         # still skipped per-device, so re-opening costs no extra SAJ calls.
-        if prev_ws and ws < prev_ws:
+        if (redo and not resuming) or (prev_ws and ws < prev_ws):
             _db("update saj_backfill_device set done=false, cursor_day=null, days_done=0, "
                 "claimed_by=null, claimed_at=null, updated_at=now()")
-            print(f"[backfill] window widened {prev_ws} -> {ws}; re-opened all devices",
-                  flush=True)
+            why = ("redo requested" if redo else
+                   f"window widened {prev_ws} -> {ws}")
+            print(f"[backfill] {why}; re-opened all devices from {ws}", flush=True)
 
         # Days pass between runs, so a device that finished against an older
         # window_end is no longer actually complete. Re-open those; the per-device
@@ -445,7 +467,7 @@ def _start(window_start: str | None = None) -> dict:
             name = f"w{i + 1}"
             t = threading.Thread(
                 target=_worker,
-                args=(name, acct["username"], acct["password"], ws, we),
+                args=(name, acct["username"], acct["password"], ws, we, redo),
                 name=f"backfill-{name}", daemon=True)
             _threads.append(t)
     for t in _threads:
@@ -476,9 +498,10 @@ def resume_if_interrupted():
         print(f"[backfill] startup check skipped: {e}", flush=True)
         return
     if j and j["state"] in ("syncing", "running", "stopping") and not _alive():
-        print("[backfill] job was interrupted — auto-resuming", flush=True)
+        redo = bool(j.get("redo"))
+        print(f"[backfill] job was interrupted — auto-resuming (redo={redo})", flush=True)
         try:
-            start()
+            start(redo=redo, resuming=True)
         except Exception as e:  # noqa: BLE001
             print(f"[backfill] auto-resume failed: {e}", flush=True)
 
@@ -523,6 +546,7 @@ def status() -> dict:
         "device_days_total": total_days,
         "pct": round(100.0 * days_done / total_days, 2) if total_days else 0.0,
         "rows_written": int(a.get("rows_written") or 0),
+        "redo": bool((j or {}).get("redo")),
         "sync_state": (j or {}).get("sync_state", "pending"),
         "sync_plants": int((j or {}).get("sync_plants") or 0),
         "sync_devices": int((j or {}).get("sync_devices") or 0),
