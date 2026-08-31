@@ -296,6 +296,45 @@ def device_info(device_sn: str):
     return info
 
 
+@app.get("/debug/writetest/{device_sn}")
+def debug_writetest(device_sn: str,
+                    token: str | None = Query(None),
+                    x_trigger_token: str | None = Header(None)):
+    """Pull today in full, upsert it, and report what the DB actually kept.
+
+    Catches the truncation in the act: counts before/after, the max stored ts,
+    and how many evening (post-18:00) rows we tried to write vs kept.
+    """
+    _check_auth(token or x_trigger_token)
+    d = fetcher._myt_today().isoformat()
+    with _lock:
+        client = _get_client()
+        rows = client.raw_data_day(device_sn, d)
+    pulled_last = max((r.get("datetime") or "") for r in rows) if rows else None
+    evening = [r for r in rows if (r.get("datetime") or "")[11:] >= "18:00:00"]
+
+    def cnt():
+        r = pg.run("select count(*) n, max(ts) mx from saj_reading where device_sn=$1 "
+                   "and (ts at time zone 'Asia/Kuala_Lumpur')::date=$2::date", [device_sn, d])
+        row = (r.get("rows") or [{}])[0]
+        return row.get("n"), str(row.get("mx"))
+
+    before = cnt()
+    err = None
+    try:
+        written = fetcher._upsert_readings(device_sn, rows)
+    except Exception as e:  # noqa: BLE001
+        written, err = None, f"{type(e).__name__}: {e}"
+    after = cnt()
+    return {
+        "day": d, "pulled_rows": len(rows), "pulled_last": pulled_last,
+        "evening_rows_pulled": len(evening),
+        "upsert_returned": written, "upsert_error": err,
+        "db_before": {"count": before[0], "max_ts": before[1]},
+        "db_after": {"count": after[0], "max_ts": after[1]},
+    }
+
+
 @app.get("/debug/saj-rawday/{device_sn}")
 def debug_saj_rawday(device_sn: str,
                      day: str | None = Query(None, description="MYT day; default today"),
