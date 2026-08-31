@@ -387,6 +387,8 @@ def sync_fast(
     plant: str | None = Query(None, description="plant name to sync"),
     customer_id: str | None = Query(None, description="exact customer id — the only "
                                     "way to pick between customers sharing a name"),
+    plant_uid: str | None = Query(None, description="exact plant uid — picks one "
+                                  "plant out of an ambiguous name"),
     days: int = Query(1, ge=1, le=MAX_DAYS, description="days back to pull per device"),
     refresh_catalog: bool = Query(False, description="re-read the plant row from SAJ first"),
     debug: bool = Query(True, description="include the per-step debug log in the response"),
@@ -404,16 +406,18 @@ def sync_fast(
     go to the service log, and the last few runs stay at `/sync/fast/log`.
     """
     _check_auth(token or x_trigger_token)
-    if sum(map(bool, (customer, plant, customer_id))) != 1:
+    if sum(map(bool, (customer, plant, customer_id, plant_uid))) != 1:
         raise HTTPException(
-            400, "give exactly one of ?customer=, ?customer_id= or ?plant=")
+            400, "give exactly one of ?customer=, ?customer_id=, ?plant= "
+                 "or ?plant_uid=")
     log = fast_sync.RunLog(debug=debug)
     try:
         with _lock:
             client = _get_client()
             out = fast_sync.run(client, customer=customer, plant=plant,
-                                customer_id=customer_id, days=days,
-                                refresh_catalog=refresh_catalog, log=log)
+                                customer_id=customer_id, plant_uid=plant_uid,
+                                days=days, refresh_catalog=refresh_catalog,
+                                log=log)
         _remember_fast_run(out)
         return out
     except fast_sync.TargetAmbiguous as e:

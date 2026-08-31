@@ -137,16 +137,20 @@ curl -X POST "https://<your-app>.up.railway.app/sync/fast?plant=Taman%20Molek&da
 What it does, in order:
 
 1. **Resolves the name against our own mirror first** — zero SAJ calls in the
-   common case. Exact normalized match wins (`"TAMAN-MOLEK"` = `"taman molek"`);
-   only if nothing matches exactly does it try a substring hit, and it refuses to
-   guess when that spans several distinct names — `409 ambiguous` lists the
-   candidates so you can be specific.
+   common case. An exact normalized match wins (`"TAMAN-MOLEK"` = `"taman molek"`);
+   otherwise every **word** of your query must appear as a whole word in the
+   candidate. Whole words matter in both directions:
+   * Plants are named `<customer> (<site>) - <installer>` — e.g. `JClands capital
+     SDN BHD (Restaurant) - SELCO` — so a customer name is only ever a *prefix* of
+     its plants. Exact-only matching would find a company's sites never.
+   * A raw substring test on the space-stripped form puts `chen` inside `cheng`,
+     so customer `Chen` reached 32 unrelated sites. Whole words don't.
+
+   When several distinct names still match, it refuses to guess: `409 ambiguous`
+   returns `choices` you can act on, and the page renders them as buttons.
 2. **Falls back to the live portal plant list** for a name the catalog has never
    seen, and writes what it finds into `saj_plant`, so the next run is fast.
-   A customer with no linked plant falls back to a plant of the same name, but
-   that fallback is **exact-only** — you named a customer, not a plant, so a
-   substring search there is our invention. (Customer `Chen` would otherwise
-   drag in 32 unrelated sites: "chen" sits inside "cheng", "chan cheng"…)
+   A customer with no linked plant falls back to plants carrying their name.
 3. **Repairs the customer edge** using the same conservative exact-name rule as
    `sync_customer_plants` — an unlinked plant matching exactly one customer gets
    linked and its devices mapped, so "sync this customer" doesn't quietly sync

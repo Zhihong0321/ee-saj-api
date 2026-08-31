@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import random
+import re
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -125,20 +126,36 @@ class TargetAmbiguous(LookupError):
 
 
 # ---- name resolution (pure — no DB, no portal) ----------------------------
-def select_by_name(rows: list[dict], field: str, query: str,
-                   exact_only: bool = False) -> list[dict]:
+def name_tokens(value: str | None) -> list[str]:
+    """Whole words of a name, lowercased. "SDN.BHD." -> ["sdn", "bhd"]."""
+    return [t for t in re.split(r"[^a-z0-9]+", (value or "").lower()) if t]
+
+
+def _choice(rows: list[dict], field: str) -> dict:
+    """A machine-usable way to pick this group of same-named rows."""
+    choice = {"label": (rows[0].get(field) or "").strip()}
+    uids = {str(r["plant_uid"]) for r in rows if r.get("plant_uid")}
+    if field == "plant_name" and len(uids) == 1:
+        choice["plant_uid"] = uids.pop()
+    return choice
+
+
+def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
     """Rows whose `field` answers to `query`.
 
-    An exact normalized match wins outright: that is the same rule the catalog
-    sync links customers on, so a name good enough to link is good enough to
-    sync. Only when nothing matches exactly do we try a substring hit, and then
-    only if every hit carries the same name — "Tan" silently picking one of five
-    Tans and syncing the wrong customer is worse than making the caller type more.
+    An exact normalized match wins outright — that is the rule the catalog sync
+    links on. Otherwise every *word* of the query must appear as a whole word in
+    the candidate. Both halves of that matter, and each was learned the hard way:
 
-    `exact_only` drops the substring pass. Use it when the caller never typed
-    this name and we synthesised it: searching plants for a customer called
-    "Chen" turns up 32 unrelated sites, because "chen" is inside "cheng",
-    "chan cheng", and half the fleet.
+    * Plants are named "<customer> (<site>) - <installer>", e.g. "JClands capital
+      SDN BHD (Restaurant) - SELCO". A customer name is only ever a prefix of its
+      plants, so requiring an exact match finds a company's sites never.
+    * Matching raw substrings on the space-stripped form put "chen" inside
+      "cheng", so customer "Chen" reached 32 unrelated sites. Whole words don't.
+
+    Several distinct names still matching is reported, not guessed at: the caller
+    gets `choices` to pick from, which for a company with two sites is the two
+    sites, and for a shared surname is the people who share it.
     """
     q = norm_name(query)
     if not q:
@@ -147,17 +164,21 @@ def select_by_name(rows: list[dict], field: str, query: str,
     exact = [r for r in rows if norm_name(r.get(field)) == q]
     if exact:
         return exact
-    if exact_only:
-        raise TargetNotFound(f"no exact match for {query!r}")
 
-    loose = [r for r in rows if q in norm_name(r.get(field))]
-    if not loose:
+    want = set(name_tokens(query))
+    hits = [r for r in rows if want and want <= set(name_tokens(r.get(field)))]
+    if not hits:
         raise TargetNotFound(f"no match for {query!r}")
-    names = sorted({(r.get(field) or "").strip() for r in loose})
-    if len(names) > 1:
-        raise TargetAmbiguous(query, names,
-                              [{"label": n, "name": n} for n in names])
-    return loose
+
+    groups: dict[str, list[dict]] = {}
+    for r in hits:
+        groups.setdefault(norm_name(r.get(field)), []).append(r)
+    if len(groups) > 1:
+        by_name = sorted(groups.values(), key=lambda g: (g[0].get(field) or ""))
+        raise TargetAmbiguous(query,
+                              [(g[0].get(field) or "").strip() for g in by_name],
+                              [_choice(g, field) for g in by_name])
+    return hits
 
 
 def customer_for_name(name: str | None, customers: list[dict]) -> str | None:
@@ -217,18 +238,16 @@ def _store_portal_plants(rows: list[dict]) -> None:
 
 
 def find_plants(name: str, stored: list[dict], client: SajClient,
-                refresh: bool = False, exact_only: bool = False,
+                refresh: bool = False,
                 log: RunLog | None = None) -> tuple[list[dict], str]:
     """Plants answering to `name` — mirror first, portal only if it has to be.
 
     Returns (plants, source). An ambiguous mirror hit is *not* retried against
     the portal: a wider search cannot make an ambiguous name less ambiguous.
-    `exact_only` forbids the substring pass (see `select_by_name`).
     """
     if not refresh:
         try:
-            return select_by_name(stored, "plant_name", name,
-                                  exact_only=exact_only), "catalog"
+            return select_by_name(stored, "plant_name", name), "catalog"
         except TargetNotFound:
             if log:
                 log.warn(f"{name!r} is not in the catalog — paging the portal's "
@@ -237,7 +256,7 @@ def find_plants(name: str, stored: list[dict], client: SajClient,
     portal = _portal_plants(client)
     if log:
         log.debug(f"portal returned {len(portal)} plants")
-    found = select_by_name(portal, "plant_name", name, exact_only=exact_only)
+    found = select_by_name(portal, "plant_name", name)
     _store_portal_plants(found)
     if log:
         log.info(f"catalogued {len(found)} plant(s) discovered on the portal")
@@ -288,7 +307,7 @@ def _device_sns(client: SajClient, plant_uid: str) -> tuple[list[str], str]:
 
 # ---- the run ---------------------------------------------------------------
 def run(client: SajClient, *, customer: str | None = None, plant: str | None = None,
-        customer_id: str | None = None,
+        customer_id: str | None = None, plant_uid: str | None = None,
         days: int = 1, link: bool = True, refresh_catalog: bool = False,
         interval: float | None = None, jitter: float | None = None,
         debug: bool | None = None, echo: bool = True,
@@ -304,16 +323,18 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
     response. Pass a `log` to have a caller collect the narration of a run that
     raises — the resolution failures are the ones worth reading.
     """
-    if sum(map(bool, (customer, plant, customer_id))) != 1:
-        raise ValueError("give exactly one of customer= / customer_id= / plant=")
+    if sum(map(bool, (customer, plant, customer_id, plant_uid))) != 1:
+        raise ValueError("give exactly one of customer= / customer_id= / "
+                         "plant= / plant_uid=")
     interval = REQ_INTERVAL if interval is None else interval
     jitter = JITTER if jitter is None else jitter
     log = log or RunLog(debug=DEBUG if debug is None else debug, echo=echo)
     calls0 = getattr(client, "calls", 0)
 
-    kind = "plant" if plant else "customer"
-    query = customer or plant or customer_id
-    log.info(f"start {'customer_id' if customer_id else kind}={query!r} "
+    kind = "plant" if (plant or plant_uid) else "customer"
+    query = customer or plant or customer_id or plant_uid
+    by_id = bool(customer_id or plant_uid)
+    log.info(f"start {kind}{'_id' if by_id else ''}={query!r} "
              f"days={days} link={link} refresh_catalog={refresh_catalog}")
     log.debug(f"db backend={pg.backend()} interval={interval}s jitter={jitter}s")
 
@@ -355,15 +376,24 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
                 log.warn(f"customer {matched_name!r} has no linked plant; "
                          "falling back to a plant of the same name")
                 try:
-                    # Exact only: the caller named a *customer*, so a loose plant
-                    # search on that name is our invention, not their intent.
                     plants, source = find_plants(matched_name, stored, client,
-                                                 refresh=refresh_catalog,
-                                                 exact_only=True, log=log)
+                                                 refresh=refresh_catalog, log=log)
                 except TargetNotFound:
                     raise TargetNotFound(
                         f"customer {matched_name!r} has no linked plant and no "
                         f"plant is named {matched_name!r}") from None
+        elif plant_uid:
+            # Picked from an ambiguous result — a uid names one plant exactly.
+            plants = [p for p in stored if str(p["plant_uid"]) == str(plant_uid)]
+            source = "catalog"
+            if not plants:
+                plants = [r for r in _portal_plants(client)
+                          if r["plant_uid"] == str(plant_uid)]
+                if not plants:
+                    raise TargetNotFound(f"no plant with uid {plant_uid!r}")
+                _store_portal_plants(plants)
+                source = "portal"
+            matched_name = plants[0].get("plant_name")
         else:
             matched_name = plant
             plants, source = find_plants(plant, stored, client,
@@ -440,7 +470,7 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
     summary = {
         "mode": "fast",
         "target": {"kind": kind,
-                   "by": "id" if query == customer_id else "name",
+                   "by": "id" if by_id else "name",
                    "query": query,
                    "matched": matched_name,
                    "customer_id": customer_id},
@@ -478,6 +508,8 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--customer", help="customer name to sync")
     group.add_argument("--plant", help="plant name to sync")
+    group.add_argument("--customer-id", help="exact customer id")
+    group.add_argument("--plant-uid", help="exact plant uid")
     parser.add_argument("--days", type=int, default=1,
                         help="days back to pull per device (1 = today only)")
     parser.add_argument("--no-link", action="store_true",
@@ -496,6 +528,7 @@ def main() -> int:
     log = RunLog(debug=not args.quiet, echo=not args.json)
     try:
         summary = run(client, customer=args.customer, plant=args.plant,
+                      customer_id=args.customer_id, plant_uid=args.plant_uid,
                       days=args.days, link=not args.no_link,
                       refresh_catalog=args.refresh_catalog, log=log)
     except (TargetAmbiguous, TargetNotFound) as e:

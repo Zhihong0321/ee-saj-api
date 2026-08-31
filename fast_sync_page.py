@@ -167,25 +167,84 @@ function renderLog(lines){
   }).join('\\n');
 }
 
+// What to send back to pick one candidate. Ids beat names: a shared customer
+// name has no other way through, and a plant uid survives a rename.
+const pick = c => c.customer_id ? {customer_id: c.customer_id}
+              : c.plant_uid ? {plant_uid: c.plant_uid}
+              : {[$('kind').value]: c.name || c.label};
+
 function renderChoices(choices){
   const box = $('choices');
   $('choicecard').style.display = choices && choices.length ? '' : 'none';
   box.innerHTML = '';
-  (choices || []).forEach(c => {
+  if (!choices || !choices.length) return;
+
+  // A company's sites all match its name — "JClands … (Restaurant)" and
+  // "… (Petrol Station)" are one customer, and asking for them one at a time is
+  // busywork. Offer the sweep, but show what it will touch first.
+  if (choices.length > 1 && choices.every(c => c.plant_uid)){
+    const all = document.createElement('button');
+    all.textContent = 'Sync all ' + choices.length;
+    all.onclick = () => goMany(choices);
+    box.appendChild(all);
+  }
+  choices.forEach(c => {
     const b = document.createElement('button');
     b.className = 'ghost';
     b.textContent = c.label || c.name;
-    if (c.customer_id) {
+    const id = c.customer_id || c.plant_uid;
+    if (id) {
       const s = document.createElement('span');
       s.className = 'mono'; s.style.color = 'var(--dim)';
-      s.textContent = '  ' + c.customer_id.slice(0, 12) + '…';
+      s.textContent = '  ' + id.slice(0, 10) + '…';
       b.appendChild(s);
     }
-    // A shared name can only be separated by id, so send that when we have it.
-    b.onclick = () => go(c.customer_id ? {customer_id: c.customer_id}
-                                       : {[$('kind').value]: c.name || c.label});
+    b.onclick = () => go(pick(c));
     box.appendChild(b);
   });
+}
+
+// Run each choice in turn and total it up. Sequential on purpose: the service
+// serialises SAJ calls behind one lock anyway, so parallel requests would only
+// queue against each other.
+async function goMany(choices){
+  const totals = {plants:0, devices:0, rows:0, saj:0, failed:0};
+  const log = [];
+  $('run').disabled = true;
+  renderChoices([]);
+  clearSummary();
+  for (let i = 0; i < choices.length; i++){
+    setState('running');
+    $('matched').textContent = 'syncing ' + (i+1) + ' of ' + choices.length;
+    const p = pick(choices[i]);
+    const q = Object.keys(p)[0] + '=' + encodeURIComponent(p[Object.keys(p)[0]]);
+    try{
+      const r = await fetch('/sync/fast?' + q + '&days=' + ($('days').value || 1),
+        {method:'POST', headers:{'X-Trigger-Token': tok.value}});
+      const j = await r.json();
+      if (r.ok){
+        totals.plants += j.plant_count; totals.devices += j.device_count;
+        totals.rows += j.rows_written; totals.failed += j.err;
+        totals.saj += (j.debug && j.debug.saj_calls) || 0;
+        log.push(...(j.log || []));
+      } else {
+        const d = (j && j.detail) || {};
+        totals.failed++;
+        log.push(...(d.log || ['[  0.00s] warn  ' + (d.detail || r.status)]));
+      }
+    }catch(e){ totals.failed++; log.push('[  0.00s] warn  ' + String(e)); }
+  }
+  setState(totals.failed ? 'error' : 'ok');
+  $('matched').textContent = choices.length + ' plants requested';
+  $('plants').textContent  = nf(totals.plants);
+  $('devices').textContent = nf(totals.devices);
+  $('rows').textContent    = nf(totals.rows);
+  $('saj').textContent     = nf(totals.saj);
+  $('failed').textContent  = nf(totals.failed);
+  $('elapsed').textContent = '-';
+  renderLog(log);
+  $('run').disabled = false;
+  recent();
 }
 
 // A failed run must not leave the previous run's numbers on screen — "ambiguous,
@@ -228,8 +287,9 @@ function showSummary(j){
 async function go(override){
   const days = $('days').value || 1;
   let q;
-  if (override && override.customer_id) {
-    q = 'customer_id=' + encodeURIComponent(override.customer_id);
+  if (override && (override.customer_id || override.plant_uid)) {
+    const k = override.customer_id ? 'customer_id' : 'plant_uid';
+    q = k + '=' + encodeURIComponent(override[k]);
   } else {
     const kind = override ? Object.keys(override)[0] : $('kind').value;
     const name = override ? override[kind] : $('name').value.trim();

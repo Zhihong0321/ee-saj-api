@@ -34,7 +34,7 @@ class SelectByNameTests(unittest.TestCase):
         rows = fast_sync.select_by_name(CUSTOMERS, "name", "Ah Seng")
         self.assertEqual([r["customer_id"] for r in rows], ["C1"])
 
-    def test_substring_fallback_finds_the_single_longer_name(self):
+    def test_a_whole_word_reaches_the_single_longer_name(self):
         rows = fast_sync.select_by_name(CUSTOMERS, "name", "Trading")
         self.assertEqual([r["customer_id"] for r in rows], ["C2"])
 
@@ -43,16 +43,39 @@ class SelectByNameTests(unittest.TestCase):
             fast_sync.select_by_name(CUSTOMERS, "name", "Ah")
         self.assertEqual(ctx.exception.candidates, ["Ah Seng", "Ah Seng Trading"])
 
-    def test_exact_only_refuses_the_substring_pass(self):
-        # Real prod case: customer "Chen" reached 32 plants because "chen" sits
-        # inside "cheng", "chan cheng", and half the fleet.
-        rows = [{"n": "Aw Cheng Zhu"}, {"n": "Chan Cheng Fatt"}, {"n": "Chen Wei Fung"}]
-        with self.assertRaises(fast_sync.TargetNotFound):
-            fast_sync.select_by_name(rows, "n", "Chen", exact_only=True)
-        # ...but an exact hit still works.
-        self.assertEqual(
-            fast_sync.select_by_name(rows, "n", "chen wei fung", exact_only=True),
-            [{"n": "Chen Wei Fung"}])
+    def test_whole_words_only_chen_is_not_inside_cheng(self):
+        # Real prod case: substring matching put "chen" inside "cheng" and
+        # reached 32 unrelated sites.
+        rows = [{"n": "Aw Cheng Zhu"}, {"n": "Chan Cheng Fatt"},
+                {"n": "Cheng Khing Yin"}, {"n": "Chen Wei Fung"}]
+        self.assertEqual(fast_sync.select_by_name(rows, "n", "Chen"),
+                         [{"n": "Chen Wei Fung"}])
+
+    def test_a_company_matches_its_sites_by_prefix_words(self):
+        # Real prod case: plants are "<customer> (<site>) - <installer>", so the
+        # customer name is only ever a prefix and exact matching finds nothing.
+        rows = [
+            {"n": "JClands capital SDN BHD (Restaurant) - SELCO", "plant_uid": "A"},
+            {"n": "JClands capital SDN BHD (Petrol Station)-SELCO", "plant_uid": "B"},
+            {"n": "Chen Wei Fung", "plant_uid": "C"},
+        ]
+        with self.assertRaises(fast_sync.TargetAmbiguous) as ctx:
+            fast_sync.select_by_name(rows, "n", "JCLANDS CAPITAL SDN.BHD.")
+        self.assertEqual(len(ctx.exception.candidates), 2)
+        self.assertEqual([c.get("plant_uid") for c in ctx.exception.choices],
+                         [None, None])  # field is "n", not "plant_name"
+
+    def test_plant_choices_carry_the_uid_that_picks_them(self):
+        rows = [
+            {"plant_name": "JClands capital SDN BHD (Restaurant) - SELCO",
+             "plant_uid": "A"},
+            {"plant_name": "JClands capital SDN BHD (Petrol Station)-SELCO",
+             "plant_uid": "B"},
+        ]
+        with self.assertRaises(fast_sync.TargetAmbiguous) as ctx:
+            fast_sync.select_by_name(rows, "plant_name", "JCLANDS CAPITAL SDN.BHD.")
+        self.assertEqual(sorted(c["plant_uid"] for c in ctx.exception.choices),
+                         ["A", "B"])
 
     def test_unknown_name_is_not_found(self):
         with self.assertRaises(fast_sync.TargetNotFound):
@@ -185,15 +208,17 @@ class RunTests(unittest.TestCase):
         self.assertIsNone(out["plants"][0]["customer_id"])
         fast_sync.link_plants.assert_not_called()
 
-    def test_a_customer_never_loose_matches_its_way_onto_a_plant(self):
-        # The mirror of the test above: the caller named a CUSTOMER, so the
-        # synthesised plant search must not settle for "Ah Seng Solar".
+    def test_an_unlinked_customer_reaches_its_suffixed_plant_but_writes_no_link(self):
+        # "Ah Seng" -> "Ah Seng Solar" is the same prefix shape as the JCLANDS
+        # sites, so it must sync. Linking stays strict, so no edge is written.
         plants = [{"plant_uid": "P7", "plant_name": "Ah Seng Solar",
                    "customer_id": None}]
-        with patch.object(fast_sync, "load_plants", return_value=plants),                 patch.object(fast_sync, "_portal_plants", return_value=[]):
-            with self.assertRaises(fast_sync.TargetNotFound):
-                fast_sync.run(self.client, customer="Ah Seng",
-                              log=fast_sync.RunLog(echo=False))
+        with patch.object(fast_sync, "load_plants", return_value=plants):
+            out = self._run({"P7": ["D7"]}, customer="Ah Seng")
+        self.assertEqual(out["device_count"], 1)
+        self.assertFalse(out["plants"][0]["linked_now"])
+        self.assertIsNone(out["plants"][0]["customer_id"])
+        fast_sync.link_plants.assert_not_called()
 
     def test_refresh_keeps_a_linked_plant_that_was_renamed(self):
         # The plant was linked as "Ah Seng" and has since been renamed in the
@@ -207,8 +232,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["plants"][0]["customer_id"], "C1")
 
     def test_an_unlinked_customer_does_not_loose_match_its_way_to_wrong_plants(self):
-        # Customer "Chen" has no linked plant. The fallback must not drag in every
-        # plant whose name merely contains "chen".
+        # Customer "Chen" has no linked plant, and "Chan Cheng Fatt" is not theirs.
         plants = [{"plant_uid": "P8", "plant_name": "Chan Cheng Fatt",
                    "customer_id": None}]
         with patch.object(fast_sync, "load_customers",
@@ -217,6 +241,30 @@ class RunTests(unittest.TestCase):
                 fast_sync.run(self.client, customer="Chen",
                               log=fast_sync.RunLog(echo=False))
         self.assertIn("no linked plant", str(ctx.exception))
+
+    def test_an_unlinked_company_reaches_its_own_sites(self):
+        # The JCLANDS case: no link, and the two plants carry a site suffix.
+        plants = [
+            {"plant_uid": "J1", "customer_id": None,
+             "plant_name": "JClands capital SDN BHD (Restaurant) - SELCO"},
+            {"plant_uid": "J2", "customer_id": None,
+             "plant_name": "JClands capital SDN BHD (Petrol Station)-SELCO"},
+        ]
+        with patch.object(fast_sync, "load_customers", return_value=[
+                {"customer_id": "CJ", "name": "JCLANDS CAPITAL SDN.BHD."}]),                 patch.object(fast_sync, "load_plants", return_value=plants):
+            with self.assertRaises(fast_sync.TargetAmbiguous) as ctx:
+                fast_sync.run(self.client, customer="JCLANDS CAPITAL SDN.BHD.",
+                              log=fast_sync.RunLog(echo=False))
+        # Both sites offered, each pickable by uid — not a dead end.
+        self.assertEqual(sorted(c["plant_uid"] for c in ctx.exception.choices),
+                         ["J1", "J2"])
+
+    def test_a_plant_uid_syncs_exactly_that_plant(self):
+        out = self._run({"P2": ["D3"]}, plant_uid="P2")
+        self.assertEqual(out["target"]["kind"], "plant")
+        self.assertEqual(out["target"]["by"], "id")
+        self.assertEqual(out["plants"][0]["plant_uid"], "P2")
+        self.assertEqual(out["device_count"], 1)
 
     def test_customer_with_no_plant_at_all_is_reported_not_found(self):
         with patch.object(fast_sync, "load_plants", return_value=[]), \
@@ -306,7 +354,8 @@ class RunTests(unittest.TestCase):
 
     def test_both_targets_is_a_usage_error(self):
         for kwargs in ({}, {"customer": "A", "plant": "B"},
-                       {"customer": "A", "customer_id": "C1"}):
+                       {"customer": "A", "customer_id": "C1"},
+                       {"plant": "A", "plant_uid": "P1"}):
             with self.assertRaises(ValueError):
                 fast_sync.run(self.client, **kwargs)
 
