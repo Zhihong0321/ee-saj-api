@@ -188,6 +188,17 @@ function renderChoices(choices){
   });
 }
 
+// A failed run must not leave the previous run's numbers on screen — "ambiguous,
+// nothing synced" sitting above "129 rows" reads as if something was synced.
+function clearSummary(){
+  ['plants','devices','rows','saj','failed','elapsed']
+    .forEach(k => $(k).textContent = '-');
+  $('matched').textContent = '';
+  $('plantcard').style.display = 'none';
+  $('errcard').style.display = 'none';
+  renderLog([]);
+}
+
 function showSummary(j){
   $('plants').textContent  = nf(j.plant_count);
   $('devices').textContent = nf(j.device_count);
@@ -230,6 +241,7 @@ async function go(override){
 
   $('msg').textContent = '';
   renderChoices([]);
+  clearSummary();
   $('run').disabled = true;
   setState('running');
   try{
