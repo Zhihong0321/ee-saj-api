@@ -334,7 +334,8 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
     kind = "plant" if (plant or plant_uid) else "customer"
     query = customer or plant or customer_id or plant_uid
     by_id = bool(customer_id or plant_uid)
-    log.info(f"start {kind}{'_id' if by_id else ''}={query!r} "
+    label = "customer_id" if customer_id else "plant_uid" if plant_uid else kind
+    log.info(f"start {label}={query!r} "
              f"days={days} link={link} refresh_catalog={refresh_catalog}")
     log.debug(f"db backend={pg.backend()} interval={interval}s jitter={jitter}s")
 

@@ -208,8 +208,9 @@ function renderChoices(choices){
 // serialises SAJ calls behind one lock anyway, so parallel requests would only
 // queue against each other.
 async function goMany(choices){
-  const totals = {plants:0, devices:0, rows:0, saj:0, failed:0};
+  const totals = {plants:0, devices:0, rows:0, saj:0, failed:0, secs:0};
   const log = [];
+  $('msg').textContent = '';
   $('run').disabled = true;
   renderChoices([]);
   clearSummary();
@@ -226,6 +227,7 @@ async function goMany(choices){
         totals.plants += j.plant_count; totals.devices += j.device_count;
         totals.rows += j.rows_written; totals.failed += j.err;
         totals.saj += (j.debug && j.debug.saj_calls) || 0;
+        totals.secs += j.elapsed_s || 0;
         log.push(...(j.log || []));
       } else {
         const d = (j && j.detail) || {};
@@ -241,7 +243,7 @@ async function goMany(choices){
   $('rows').textContent    = nf(totals.rows);
   $('saj').textContent     = nf(totals.saj);
   $('failed').textContent  = nf(totals.failed);
-  $('elapsed').textContent = '-';
+  $('elapsed').textContent = totals.secs.toFixed(1) + 's';
   renderLog(log);
   $('run').disabled = false;
   recent();
