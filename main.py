@@ -762,6 +762,25 @@ async def agent_ask(
 
 
 @app.on_event("startup")
+def _remove_daylight_cutoff():
+    """Drop the DB trigger that silently discarded every reading outside
+    06:00–18:00 MYT.
+
+    `saj_reject_night_readings()` returned NULL from a BEFORE INSERT/UPDATE on
+    saj_reading for any ts before 06:00 or at/after 18:00 Malaysia time — so the
+    evening tail (SAJ writes to ~19:15) and pre-dawn rows were dropped on write,
+    with no error, for every inverter. That is the 17:55 cutoff. This service
+    exists to store the full feed, so the trigger must not exist. Idempotent."""
+    for sql in ("drop trigger if exists saj_reading_daylight_only on saj_reading",
+                "drop function if exists saj_reject_night_readings()"):
+        r = pg.run(sql)
+        if isinstance(r, dict) and r.get("error"):
+            print(f"[migrate] daylight-cutoff drop failed: {sql} -> {r}", flush=True)
+        else:
+            print(f"[migrate] daylight-cutoff: {sql}", flush=True)
+
+
+@app.on_event("startup")
 def _seed_accounts():
     """One-time migration off env vars: if saj_account is empty, copy the Railway
     SAJ_USER/SAJ_PASS (+ BACKFILL_USERS) in so the first boot after this deploy
