@@ -125,7 +125,8 @@ class TargetAmbiguous(LookupError):
 
 
 # ---- name resolution (pure — no DB, no portal) ----------------------------
-def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
+def select_by_name(rows: list[dict], field: str, query: str,
+                   exact_only: bool = False) -> list[dict]:
     """Rows whose `field` answers to `query`.
 
     An exact normalized match wins outright: that is the same rule the catalog
@@ -133,6 +134,11 @@ def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
     sync. Only when nothing matches exactly do we try a substring hit, and then
     only if every hit carries the same name — "Tan" silently picking one of five
     Tans and syncing the wrong customer is worse than making the caller type more.
+
+    `exact_only` drops the substring pass. Use it when the caller never typed
+    this name and we synthesised it: searching plants for a customer called
+    "Chen" turns up 32 unrelated sites, because "chen" is inside "cheng",
+    "chan cheng", and half the fleet.
     """
     q = norm_name(query)
     if not q:
@@ -141,6 +147,8 @@ def select_by_name(rows: list[dict], field: str, query: str) -> list[dict]:
     exact = [r for r in rows if norm_name(r.get(field)) == q]
     if exact:
         return exact
+    if exact_only:
+        raise TargetNotFound(f"no exact match for {query!r}")
 
     loose = [r for r in rows if q in norm_name(r.get(field))]
     if not loose:
@@ -209,16 +217,18 @@ def _store_portal_plants(rows: list[dict]) -> None:
 
 
 def find_plants(name: str, stored: list[dict], client: SajClient,
-                refresh: bool = False,
+                refresh: bool = False, exact_only: bool = False,
                 log: RunLog | None = None) -> tuple[list[dict], str]:
     """Plants answering to `name` — mirror first, portal only if it has to be.
 
     Returns (plants, source). An ambiguous mirror hit is *not* retried against
     the portal: a wider search cannot make an ambiguous name less ambiguous.
+    `exact_only` forbids the substring pass (see `select_by_name`).
     """
     if not refresh:
         try:
-            return select_by_name(stored, "plant_name", name), "catalog"
+            return select_by_name(stored, "plant_name", name,
+                                  exact_only=exact_only), "catalog"
         except TargetNotFound:
             if log:
                 log.warn(f"{name!r} is not in the catalog — paging the portal's "
@@ -227,7 +237,7 @@ def find_plants(name: str, stored: list[dict], client: SajClient,
     portal = _portal_plants(client)
     if log:
         log.debug(f"portal returned {len(portal)} plants")
-    found = select_by_name(portal, "plant_name", name)
+    found = select_by_name(portal, "plant_name", name, exact_only=exact_only)
     _store_portal_plants(found)
     if log:
         log.info(f"catalogued {len(found)} plant(s) discovered on the portal")
@@ -345,8 +355,11 @@ def run(client: SajClient, *, customer: str | None = None, plant: str | None = N
                 log.warn(f"customer {matched_name!r} has no linked plant; "
                          "falling back to a plant of the same name")
                 try:
+                    # Exact only: the caller named a *customer*, so a loose plant
+                    # search on that name is our invention, not their intent.
                     plants, source = find_plants(matched_name, stored, client,
-                                                 refresh=refresh_catalog, log=log)
+                                                 refresh=refresh_catalog,
+                                                 exact_only=True, log=log)
                 except TargetNotFound:
                     raise TargetNotFound(
                         f"customer {matched_name!r} has no linked plant and no "

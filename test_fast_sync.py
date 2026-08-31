@@ -43,6 +43,17 @@ class SelectByNameTests(unittest.TestCase):
             fast_sync.select_by_name(CUSTOMERS, "name", "Ah")
         self.assertEqual(ctx.exception.candidates, ["Ah Seng", "Ah Seng Trading"])
 
+    def test_exact_only_refuses_the_substring_pass(self):
+        # Real prod case: customer "Chen" reached 32 plants because "chen" sits
+        # inside "cheng", "chan cheng", and half the fleet.
+        rows = [{"n": "Aw Cheng Zhu"}, {"n": "Chan Cheng Fatt"}, {"n": "Chen Wei Fung"}]
+        with self.assertRaises(fast_sync.TargetNotFound):
+            fast_sync.select_by_name(rows, "n", "Chen", exact_only=True)
+        # ...but an exact hit still works.
+        self.assertEqual(
+            fast_sync.select_by_name(rows, "n", "chen wei fung", exact_only=True),
+            [{"n": "Chen Wei Fung"}])
+
     def test_unknown_name_is_not_found(self):
         with self.assertRaises(fast_sync.TargetNotFound):
             fast_sync.select_by_name(CUSTOMERS, "name", "Nobody")
@@ -163,16 +174,26 @@ class RunTests(unittest.TestCase):
         self.assertTrue(out["plants"][0]["linked_now"])
 
     def test_a_loose_plant_match_syncs_but_refuses_to_write_a_link(self):
-        # "Ah Seng" reaches the plant "Ah Seng Solar", but only an exact name
-        # match is allowed to create a customer edge.
+        # Searching by PLANT is allowed to be loose — the caller typed that name.
+        # "Ah Seng" reaches "Ah Seng Solar", but only an exact match may link.
         plants = [{"plant_uid": "P7", "plant_name": "Ah Seng Solar",
                    "customer_id": None}]
         with patch.object(fast_sync, "load_plants", return_value=plants):
-            out = self._run({"P7": ["D7"]}, customer="Ah Seng")
+            out = self._run({"P7": ["D7"]}, plant="Ah Seng")
         self.assertEqual(out["device_count"], 1)          # readings still synced
         self.assertFalse(out["plants"][0]["linked_now"])  # but no link written
         self.assertIsNone(out["plants"][0]["customer_id"])
         fast_sync.link_plants.assert_not_called()
+
+    def test_a_customer_never_loose_matches_its_way_onto_a_plant(self):
+        # The mirror of the test above: the caller named a CUSTOMER, so the
+        # synthesised plant search must not settle for "Ah Seng Solar".
+        plants = [{"plant_uid": "P7", "plant_name": "Ah Seng Solar",
+                   "customer_id": None}]
+        with patch.object(fast_sync, "load_plants", return_value=plants),                 patch.object(fast_sync, "_portal_plants", return_value=[]):
+            with self.assertRaises(fast_sync.TargetNotFound):
+                fast_sync.run(self.client, customer="Ah Seng",
+                              log=fast_sync.RunLog(echo=False))
 
     def test_refresh_keeps_a_linked_plant_that_was_renamed(self):
         # The plant was linked as "Ah Seng" and has since been renamed in the
@@ -184,6 +205,18 @@ class RunTests(unittest.TestCase):
         self.assertEqual(out["catalog_source"], "portal")
         self.assertEqual(out["plants"][0]["plant_name"], "Ah Seng (new roof)")
         self.assertEqual(out["plants"][0]["customer_id"], "C1")
+
+    def test_an_unlinked_customer_does_not_loose_match_its_way_to_wrong_plants(self):
+        # Customer "Chen" has no linked plant. The fallback must not drag in every
+        # plant whose name merely contains "chen".
+        plants = [{"plant_uid": "P8", "plant_name": "Chan Cheng Fatt",
+                   "customer_id": None}]
+        with patch.object(fast_sync, "load_customers",
+                          return_value=[{"customer_id": "C7", "name": "Chen"}]),                 patch.object(fast_sync, "load_plants", return_value=plants),                 patch.object(fast_sync, "_portal_plants", return_value=[]):
+            with self.assertRaises(fast_sync.TargetNotFound) as ctx:
+                fast_sync.run(self.client, customer="Chen",
+                              log=fast_sync.RunLog(echo=False))
+        self.assertIn("no linked plant", str(ctx.exception))
 
     def test_customer_with_no_plant_at_all_is_reported_not_found(self):
         with patch.object(fast_sync, "load_plants", return_value=[]), \

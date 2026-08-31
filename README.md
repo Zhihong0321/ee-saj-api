@@ -143,6 +143,10 @@ What it does, in order:
    candidates so you can be specific.
 2. **Falls back to the live portal plant list** for a name the catalog has never
    seen, and writes what it finds into `saj_plant`, so the next run is fast.
+   A customer with no linked plant falls back to a plant of the same name, but
+   that fallback is **exact-only** — you named a customer, not a plant, so a
+   substring search there is our invention. (Customer `Chen` would otherwise
+   drag in 32 unrelated sites: "chen" sits inside "cheng", "chan cheng"…)
 3. **Repairs the customer edge** using the same conservative exact-name rule as
    `sync_customer_plants` — an unlinked plant matching exactly one customer gets
    linked and its devices mapped, so "sync this customer" doesn't quietly sync
