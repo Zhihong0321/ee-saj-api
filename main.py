@@ -637,7 +637,10 @@ def _retention_worker(rollup_recent_days: int, dry_run: bool):
 @app.post("/maintenance/retention")
 def maintenance_retention(
     dry_run: bool = Query(False, description="report what would happen, delete nothing"),
-    rollup_recent_days: int = Query(10, ge=1, le=120),
+    rollup_recent_days: int = Query(10, ge=1, le=400,
+                                    description="re-roll this many recent days; must "
+                                                "cover the whole retained window after "
+                                                "a history repair"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
 ):
