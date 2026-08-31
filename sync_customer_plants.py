@@ -29,11 +29,11 @@ MATCH_METHOD = "name_exact"
 MATCH_CONFIDENCE = 0.9
 
 
-def _norm(value: str | None) -> str:
+def norm_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]", "", (value or "").lower())
 
 
-def _float(value: Any) -> float | None:
+def to_float(value: Any) -> float | None:
     try:
         return float(value) if value is not None else None
     except (TypeError, ValueError):
@@ -127,7 +127,7 @@ def build_plan(
     customer_ids = {str(row["customer_id"]) for row in customers}
     customers_by_name: dict[str, list[str]] = defaultdict(list)
     for row in customers:
-        key = _norm(row.get("name"))
+        key = norm_name(row.get("name"))
         if key:
             customers_by_name[key].append(str(row["customer_id"]))
 
@@ -169,7 +169,7 @@ def build_plan(
             plant_name,
             plant.get("ownerName"),
             plant.get("installerName"),
-            _float(plant.get("pvPower")),
+            to_float(plant.get("pvPower")),
             str(running_state) if running_state is not None else None,
             plant.get("typeName"),
         ))
@@ -182,7 +182,7 @@ def build_plan(
             customer_id = existing_customer
             plan.existing_links += 1
         else:
-            matches = sorted(set(customers_by_name.get(_norm(plant_name), [])))
+            matches = sorted(set(customers_by_name.get(norm_name(plant_name), [])))
             if not matches:
                 plan.unmatched_plants.append(plant_uid)
                 continue
@@ -230,7 +230,7 @@ def _values_placeholders(rows: list[tuple], width: int) -> tuple[str, list[Any]]
     return ",".join(placeholders), params
 
 
-def _insert_device_maps(rows: list[tuple], batch_size: int = 200) -> int:
+def insert_device_maps(rows: list[tuple], batch_size: int = 200) -> int:
     total = 0
     for offset in range(0, len(rows), batch_size):
         chunk = rows[offset:offset + batch_size]
@@ -251,7 +251,7 @@ def _insert_device_maps(rows: list[tuple], batch_size: int = 200) -> int:
     return total
 
 
-def _link_plants(rows: list[tuple], batch_size: int = 200) -> int:
+def link_plants(rows: list[tuple], batch_size: int = 200) -> int:
     total = 0
     for offset in range(0, len(rows), batch_size):
         chunk = rows[offset:offset + batch_size]
@@ -288,8 +288,8 @@ def apply_plan(plan: SyncPlan) -> dict:
         "device_sn",
         ["plant_uid"],
     )
-    maps_written = _insert_device_maps(plan.device_maps)
-    plants_linked = _link_plants(plan.plant_links)
+    maps_written = insert_device_maps(plan.device_maps)
+    plants_linked = link_plants(plan.plant_links)
     return {
         "catalog_plants_sent": len(plan.plant_rows),
         "catalog_devices_sent": len(plan.device_rows),

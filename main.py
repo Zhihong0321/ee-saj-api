@@ -5,6 +5,8 @@ Trigger a fetch of the 5-min generation feed from the SAJ portal into prod
 
     POST /fetch/device/{device_sn}?days=1[&force=true]   one inverter
     POST /fetch/plant/{plant_uid}?days=1[&force=true]     every inverter in a plant
+    POST /sync/fast?customer=NAME | ?plant=NAME           one named account, by name
+    GET  /sync/fast/log                                   recent fast syncs + debug log
     GET  /device/{device_sn}/latest                       confirm what landed
     GET  /backfill                                        one-time history copy UI
     GET  /health                                          liveness + config
@@ -42,6 +44,7 @@ import fetcher
 import pg
 import r2
 import backfill
+import fast_sync
 import retention
 from backfill_page import PAGE as BACKFILL_PAGE
 from saj_api import SajClient, SajError
@@ -351,6 +354,88 @@ def sync_all(
 @app.get("/sync/status")
 def sync_status():
     return _sync_state
+
+
+# ---- fast sync: one named customer or plant -------------------------------
+# Keeps the last few runs in memory so a live prod test can be inspected after
+# the fact (and after an app-triggered run nobody was watching).
+FAST_RUN_HISTORY = int(os.environ.get("FAST_RUN_HISTORY", "20"))
+_fast_lock = threading.Lock()
+_fast_runs: list[dict] = []
+
+
+def _remember_fast_run(summary: dict) -> None:
+    entry = {k: v for k, v in summary.items() if k != "plants"}
+    entry["at"] = dt.datetime.utcnow().isoformat() + "Z"
+    entry["plants"] = [{"plant_uid": p["plant_uid"], "plant_name": p["plant_name"],
+                        "customer_id": p["customer_id"],
+                        "devices": len(p["devices"]),
+                        "rows_written": p["rows_written"]}
+                       for p in summary.get("plants", [])]
+    with _fast_lock:
+        _fast_runs.append(entry)
+        del _fast_runs[:-FAST_RUN_HISTORY]
+
+
+@app.post("/sync/fast")
+def sync_fast(
+    customer: str | None = Query(None, description="customer name to sync"),
+    plant: str | None = Query(None, description="plant name to sync"),
+    days: int = Query(1, ge=1, le=MAX_DAYS, description="days back to pull per device"),
+    refresh_catalog: bool = Query(False, description="re-read the plant row from SAJ first"),
+    debug: bool = Query(True, description="include the per-step debug log in the response"),
+    token: str | None = Query(None),
+    x_trigger_token: str | None = Header(None),
+):
+    """Sync one named customer or plant — seconds, instead of the nightly sweep.
+
+    Runs inline (a single account is a handful of devices, not the fleet), so
+    the response carries the result rather than a job id. Holds the shared SAJ
+    lock for the duration like the other fetch routes.
+
+    Every response — including the 404/409/502 ones — carries the run's `log`,
+    so a prod test is diagnosable from the response alone. The same lines also
+    go to the service log, and the last few runs stay at `/sync/fast/log`.
+    """
+    _check_auth(token or x_trigger_token)
+    if bool(customer) == bool(plant):
+        raise HTTPException(400, "give exactly one of ?customer= or ?plant=")
+    log = fast_sync.RunLog(debug=debug)
+    try:
+        with _lock:
+            client = _get_client()
+            out = fast_sync.run(client, customer=customer, plant=plant, days=days,
+                                refresh_catalog=refresh_catalog, log=log)
+        _remember_fast_run(out)
+        return out
+    except fast_sync.TargetAmbiguous as e:
+        log.warn(f"ambiguous: {e}")
+        raise HTTPException(409, {"error": "ambiguous", "query": e.query,
+                                  "candidates": e.candidates[:20],
+                                  "log": log.lines})
+    except fast_sync.TargetNotFound as e:
+        log.warn(f"not found: {e}")
+        raise HTTPException(404, {"error": "not_found", "detail": str(e),
+                                  "log": log.lines})
+    except SajError as e:
+        log.warn(f"SAJ error {e.err_code}: {e.err_msg}")
+        raise HTTPException(502, {"error": "saj", "err_code": e.err_code,
+                                  "detail": e.err_msg, "log": log.lines})
+    except Exception as e:  # noqa: BLE001 — a prod test deserves the log, not a 500
+        log.warn(f"unhandled {type(e).__name__}: {e}")
+        raise HTTPException(500, {"error": type(e).__name__, "detail": str(e),
+                                  "log": log.lines})
+
+
+@app.get("/sync/fast/log")
+def sync_fast_log(limit: int = Query(5, ge=1, le=FAST_RUN_HISTORY)):
+    """The last few fast syncs this instance ran, newest first.
+
+    Railway redeploys wipe this — it is a debugging convenience for a live test
+    session, not an audit trail.
+    """
+    with _fast_lock:
+        return {"runs": list(reversed(_fast_runs))[:limit], "kept": len(_fast_runs)}
 
 
 # ---- one-time historical copy: browser-driven, resumable ------------------

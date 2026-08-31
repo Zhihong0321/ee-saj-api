@@ -1,9 +1,66 @@
 import datetime as dt
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import fetcher
-from saj_api import SajClient
+from saj_api import SajClient, SajError
+
+
+class SajClientCallCounterTests(unittest.TestCase):
+    """The counter the fast-sync debug layer reports its portal cost from."""
+
+    def _client(self):
+        client = object.__new__(SajClient)
+        client.calls = 0
+        client.call_counts = {}
+        client.token = "t"
+        client.org_code = "OAhz"
+        client.lang = "en"
+        client.theme = "dark"
+        client._username = None
+        client._password = None
+        client._client_date = lambda: "2026-01-01"
+        return client
+
+    def test_each_request_is_counted_by_path(self):
+        client = self._client()
+
+        class Resp:
+            status_code = 200
+
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"errCode": 0, "data": {}}
+
+        client.http = Mock()
+        client.http.post.return_value = Resp()
+
+        client.call("/a")
+        client.call("/a")
+        client.call("/b")
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(client.call_counts, {"/a": 2, "/b": 1})
+
+    def test_a_relogin_retry_counts_as_the_two_requests_it_is(self):
+        client = self._client()
+        client._username, client._password = "u", "p"
+        client.login = lambda u, p: setattr(client, "token", "fresh")
+        seen = []
+
+        def raw(path, payload=None, timeout=30, with_org=True, with_token=True):
+            client.calls += 1  # stands in for the real _raw_call's counting
+            seen.append(path)
+            if len(seen) == 1:
+                raise SajError(10002, "session expired")
+            return {}
+
+        client._raw_call = raw
+        client.call("/needs-auth")
+
+        self.assertEqual(client.calls, 2)
 
 
 class SajClientOptimizationTests(unittest.TestCase):

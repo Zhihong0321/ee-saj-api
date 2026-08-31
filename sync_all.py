@@ -17,15 +17,23 @@ Env:
   SYNC_LIMIT=                cap device count (testing)
 
 Run:  python sync_all.py
+
+Fast mode: pass --customer or --plant to sync just that one account instead of
+the fleet — seconds, instead of the ~20 minute sweep. See fast_sync.py.
+
+    python sync_all.py --customer "Ah Seng"
+    python sync_all.py --plant "Taman Molek" --days 7
 """
 from __future__ import annotations
 
+import argparse
 import os
 import time
 import random
 
 import pg
 import fetcher
+import fast_sync
 from saj_api import SajClient
 
 REQ_INTERVAL = float(os.environ.get("SAJ_REQ_INTERVAL", "1.0"))
@@ -43,25 +51,51 @@ def _device_sns(client: SajClient) -> list[str]:
     return [sn for _, _, sn in client.iter_all_devices()]
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--customer", help="fast mode: sync only this customer")
+    target.add_argument("--plant", help="fast mode: sync only this plant")
+    parser.add_argument("--days", type=int, default=DAYS,
+                        help="days back to pull (default: SYNC_DAYS)")
+    parser.add_argument("--limit", type=int, default=LIMIT,
+                        help="cap device count (default: SYNC_LIMIT)")
+    return parser.parse_args()
+
+
 def main():
+    args = _parse_args()
     user = os.environ.get("SAJ_USER")
     pw = os.environ.get("SAJ_PASS")
     if not (user and pw):
         raise SystemExit("SAJ_USER / SAJ_PASS not set")
 
     client = SajClient(username=user, password=pw)
+
+    if args.customer or args.plant:
+        try:
+            summary = fast_sync.run(client, customer=args.customer,
+                                    plant=args.plant, days=args.days)
+        except fast_sync.TargetAmbiguous as e:
+            raise SystemExit(f"[fast] ambiguous: {e}")
+        except fast_sync.TargetNotFound as e:
+            raise SystemExit(f"[fast] not found: {e}")
+        return 1 if summary["err"] else 0
+
     sns = _device_sns(client)
-    if LIMIT:
-        sns = sns[:LIMIT]
+    if args.limit:
+        sns = sns[:args.limit]
     total = len(sns)
-    print(f"[sync-all] backend={pg.backend()} devices={total} days={DAYS} "
+    print(f"[sync-all] backend={pg.backend()} devices={total} days={args.days} "
           f"interval={REQ_INTERVAL}s", flush=True)
 
     ok = err = rows = 0
     t0 = time.time()
     for i, sn in enumerate(sns, 1):
         try:
-            res = fetcher.fetch_device(client, sn, days=DAYS)  # no gate -> full pull
+            res = fetcher.fetch_device(client, sn, days=args.days)  # no gate -> full pull
             rows += res["rows_written"]
             ok += 1
         except Exception as e:  # noqa: BLE001 — keep the sweep alive
@@ -74,7 +108,8 @@ def main():
 
     print(f"[sync-all] DONE ok={ok} err={err} rows={rows} in "
           f"{time.time() - t0:.0f}s", flush=True)
+    return 1 if err else 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

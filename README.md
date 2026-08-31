@@ -18,6 +18,8 @@ chart data for completed historical days, and upserts them into Postgres.
 |---|---|---|
 | `POST` | `/fetch/plant/{plant_uid}?days=1` | **Main app call** — refresh the plant into prod, return chart-ready `series` + `daily` |
 | `POST` | `/fetch/device/{device_sn}?days=1` | Same for one inverter serial (adds `latest`) |
+| `POST` | `/sync/fast?customer=NAME` or `?plant=NAME` | **Fast sync** — resolve a name to its plants and sync just those |
+| `GET`  | `/sync/fast/log?limit=5` | The last fast syncs this instance ran (in-memory debug log) |
 | `GET`  | `/plant/{plant_uid}/series?days=1` | Chart data straight from prod — no SAJ call, no token |
 | `GET`  | `/device/{device_sn}/series?days=1` | Same, one inverter |
 | `GET`  | `/device/{device_sn}/info` | Inverter model / rated kW / phase / firmware / image (DB-cached; self-populates once) |
@@ -44,6 +46,10 @@ curl -X POST "https://<your-app>.up.railway.app/fetch/plant/<PLANT_UID>?days=1" 
 
 # confirm what landed
 curl "https://<your-app>.up.railway.app/device/R6M2063J2516E18728/latest"
+
+# fast sync — by customer name, no UID needed
+curl -X POST "https://<your-app>.up.railway.app/sync/fast?customer=Ah%20Seng" \
+     -H "X-Trigger-Token: $TRIGGER_TOKEN"
 ```
 
 If `TRIGGER_TOKEN` is unset the token header is not required (fine for a first
@@ -101,6 +107,90 @@ python sync_customer_plants.py --apply
 
 `--apply` requires `DATABASE_URL`; write mode deliberately refuses the HTTP proxy.
 Use the same `SAJ_USER`, `SAJ_PASS`, and `DATABASE_URL` as the deployed service.
+
+## Fast sync — one named customer or plant
+
+`fast_sync.py` is the "just this one account, right now" path: give it a
+**name** instead of a UID and it syncs only the plants behind it. A one-plant
+customer takes seconds, versus the ~20 minute full sweep.
+
+```bash
+python fast_sync.py --customer "Ah Seng"          # or: python sync_all.py --customer "Ah Seng"
+python fast_sync.py --plant "Taman Molek" --days 7
+```
+
+```bash
+curl -X POST "https://<your-app>.up.railway.app/sync/fast?plant=Taman%20Molek&days=7" \
+     -H "X-Trigger-Token: $TRIGGER_TOKEN"
+```
+
+What it does, in order:
+
+1. **Resolves the name against our own mirror first** — zero SAJ calls in the
+   common case. Exact normalized match wins (`"TAMAN-MOLEK"` = `"taman molek"`);
+   only if nothing matches exactly does it try a substring hit, and it refuses to
+   guess when that spans several distinct names — `409 ambiguous` lists the
+   candidates so you can be specific.
+2. **Falls back to the live portal plant list** for a name the catalog has never
+   seen, and writes what it finds into `saj_plant`, so the next run is fast.
+3. **Repairs the customer edge** using the same conservative exact-name rule as
+   `sync_customer_plants` — an unlinked plant matching exactly one customer gets
+   linked and its devices mapped, so "sync this customer" doesn't quietly sync
+   nothing for a customer nobody has linked yet. Finding a plant may be loose,
+   but *writing* a link never is: a substring hit syncs the readings and leaves
+   the link alone. `--no-link` skips step 3 entirely.
+4. **Pulls readings** for each device, rate-throttled the same as the sweep. One
+   failing inverter is reported, never fatal.
+
+Like the nightly sweep it is **always a full pull** — the per-visit freshness
+gate that protects `/fetch/*` from refresh-hammering does not apply, because
+naming an account is an explicit request for current data.
+
+| Flag / param | Effect |
+|---|---|
+| `--days N` / `&days=N` | days back per device (default 1 = today; capped by `MAX_DAYS` over HTTP) |
+| `--no-link` | pull readings only; leave the customer/plant links alone |
+| `--refresh-catalog` / `&refresh_catalog=true` | re-read the plant's name/owner/state from SAJ first (follows the plant UID, so a renamed plant is still found) |
+
+Exit codes: `0` ok, `1` some devices failed, `2` ambiguous name, `3` no match.
+Over HTTP those last two are `409` and `404`.
+
+### Log / debug layer
+
+Every fast sync narrates itself. The lines go to the service log (Railway) **and
+come back in the response**, so a prod test is diagnosable from what you already
+have in the terminal — no hunting through deploy logs to find out why a name
+didn't resolve. The `404`/`409`/`502`/`500` bodies carry the log too.
+
+```
+[fast] [  0.00s] info  start customer='Ah Seng' days=1 link=True refresh_catalog=False
+[fast] [  0.00s] debug db backend=database_url interval=1.0s jitter=0.3s
+[fast] [  0.31s] debug mirror: customers=7913 plants=955 linked=576
+[fast] [  0.31s] info  customer 'Ah Seng' -> C1042
+[fast] [  0.31s] debug plants linked to C1042: 1
+[fast] [  0.31s] info  matched 1 plant(s) via catalog
+[fast] [  0.34s] debug   plant 122A1E…: 2 device(s) from catalog ['R6M…', 'R6M…']
+[fast] [  0.34s] info  devices=2 days=1 (saj calls so far: 0)
+[fast] [  4.10s] debug   R6M…: 288 rows (live) in 3.7s
+[fast] [  8.02s] info  DONE plants=1 devices=2 ok=2 err=0 rows=576 saj_calls=6 in 8.0s
+```
+
+Alongside the log, each summary carries a `debug` block:
+
+| Field | Why you want it |
+|---|---|
+| `timings_s` | per phase — `load_mirror`, `resolve`, `devices_and_links`, `readings` |
+| `saj_calls` | portal requests this run actually cost |
+| `saj_calls_before_readings` | should be `0` on a catalog hit — proves resolution stayed local |
+| `db_backend` | `database_url` vs `proxy`, the usual cause of a surprise read-only failure |
+| `mirror` | how many customers/plants the name was matched against |
+
+`GET /sync/fast/log?limit=5` replays the last runs this instance did (in-memory,
+newest first, cleared by a redeploy) — for when the app triggered a sync nobody
+was watching. Tunables: `FAST_SYNC_DEBUG=0` drops the debug lines to info-only,
+`FAST_RUN_HISTORY` (default 20) sizes the buffer, `&debug=false` quiets one call.
+On the CLI, `--quiet` is the same as `FAST_SYNC_DEBUG=0` and `--json` prints only
+the summary.
 
 ## Two operating modes
 

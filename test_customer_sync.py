@@ -103,7 +103,7 @@ class CustomerPlantPlanTests(unittest.TestCase):
     def test_device_insert_has_cross_customer_conflict_guard(self):
         rows = [("C1", "D1", "P1", "name_exact", 0.9, False)]
         with patch.object(sync.pg, "run", return_value={"rowcount": 1}) as run:
-            written = sync._insert_device_maps(rows)
+            written = sync.insert_device_maps(rows)
 
         sql, params = run.call_args.args
         self.assertIn("where m.device_sn=v.device_sn", sql)

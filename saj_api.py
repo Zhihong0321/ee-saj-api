@@ -77,6 +77,10 @@ class SajClient:
         self.org_code = org_code
         self.lang = lang
         self.theme = theme
+        # Portal-request counters. Long-lived clients accumulate, so callers that
+        # want a per-operation figure snapshot these and take the delta.
+        self.calls = 0
+        self.call_counts: dict[str, int] = {}
         self.http = requests.Session()
         self.http.headers.update({
             "Accept": "application/json, text/plain, */*",
@@ -135,6 +139,10 @@ class SajClient:
     def _raw_call(self, path: str, payload: dict | None = None, timeout: int = 30,
                   with_org: bool = True, with_token: bool = True) -> dict:
         """POST to a /dev-api endpoint with full signing. Returns the `data` field."""
+        # Counted here, not in call(), so a re-login retry shows as the two
+        # requests it really is.
+        self.calls += 1
+        self.call_counts[path] = self.call_counts.get(path, 0) + 1
         ts = int(time.time() * 1000)
         client_date = self._client_date()
         body = {
