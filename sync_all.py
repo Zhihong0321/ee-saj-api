@@ -52,7 +52,7 @@ def _make_client() -> SajClient:
 
 REQ_INTERVAL = float(os.environ.get("SAJ_REQ_INTERVAL", "1.0"))
 JITTER = float(os.environ.get("SAJ_REQ_JITTER", "0.3"))
-DAYS = int(os.environ.get("SYNC_DAYS", "1"))
+DAYS = int(os.environ.get("SYNC_DAYS", "3"))
 LIMIT = int(os.environ["SYNC_LIMIT"]) if os.environ.get("SYNC_LIMIT") else None
 
 

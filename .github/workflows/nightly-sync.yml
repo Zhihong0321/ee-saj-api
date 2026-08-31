@@ -2,8 +2,11 @@ name: Nightly SAJ fleet sync
 
 on:
   schedule:
-    # 15:00 UTC = 23:00 MYT
+    # Twice, so a dropped/late GitHub run never leaves a day incomplete.
+    # 15:00 UTC = 23:00 MYT (evening done ~19:15, so today lands in full)
     - cron: '0 15 * * *'
+    # 20:00 UTC = 04:00 MYT (safety net: re-completes yesterday if 23:00 was missed)
+    - cron: '0 20 * * *'
   workflow_dispatch: {}
 
 jobs:
@@ -11,7 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Kick off /sync/all (fire-and-forget, runs in background on the server)
+        # days=3 -> today + the last two completed MYT days, re-pulled in full, so
+        # the evening tail SAJ adds after our first pull is always back-filled and
+        # never frozen at ~18:00.
         run: |
           curl -sS -X POST "https://ee-saj-api-production.up.railway.app/sync/all" \
             --data-urlencode "token=${{ secrets.SYNC_TRIGGER_TOKEN }}" \
+            --data-urlencode "days=3" \
             -G --fail-with-body

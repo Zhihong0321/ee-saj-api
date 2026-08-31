@@ -357,7 +357,9 @@ def _sync_all_worker(days: int, limit: int | None):
 
 @app.post("/sync/all")
 def sync_all(
-    days: int = Query(1, ge=1, le=MAX_DAYS, description="days back to pull per device"),
+    days: int = Query(3, ge=1, le=MAX_DAYS,
+                      description="days back to pull per device (>=2 re-completes "
+                                  "recent days so no evening tail is ever frozen)"),
     limit: int | None = Query(None, description="cap device count (testing)"),
     token: str | None = Query(None),
     x_trigger_token: str | None = Header(None),
@@ -366,6 +368,12 @@ def sync_all(
 
     Meant to be called once nightly by an external cron (no Railway Cron
     service needed). Refuses to start a second sweep while one is running.
+
+    Pulls today plus the last couple of completed MYT days in full every run.
+    Today is still accumulating when we pull it, so its last hour only lands once
+    a later pull sees it — re-fetching the recent completed days guarantees each
+    day is eventually stored end-to-end (to ~19:15), never frozen at the ~18:00
+    of whatever pull happened to be last that day.
     """
     _check_auth(token or x_trigger_token)
     with _sync_lock:

@@ -38,6 +38,17 @@ def _f(x):
         return None
 
 
+def _myt_today() -> dt.date:
+    """Today's Malaysia calendar date.
+
+    The SAJ feed is Malaysia-local and day-keyed, so "today" and every day we
+    step back from it must be the MYT day — never the host's local/UTC date,
+    which on Railway can point at the wrong day for hours around midnight and
+    make us pull (and freeze) an incomplete day.
+    """
+    return (dt.datetime.utcnow() + dt.timedelta(hours=8)).date()
+
+
 def _upsert_readings(sn: str, rows: list[dict], batch: int = 200) -> int:
     """Upsert raw 5-min rows for one device. Returns rows written."""
     n = len(_COLS)
@@ -165,7 +176,7 @@ def fetch_device(client, device_sn: str, days: int = 1,
             return {"rows_written": 0, "source": "cache", "latest": latest(device_sn)}
 
     total = 0
-    today = dt.date.today()
+    today = _myt_today()
     for i in range(days):
         day = (today - dt.timedelta(days=i)).isoformat()
         rows = (client.raw_data_day(device_sn, day) if i == 0 else
@@ -219,7 +230,7 @@ def fetch_device_history(client, device_sn: str, days: int = 31,
     Returns {"rows_written", "days_pulled", "days_skipped", "latest"}.
     """
     total = pulled = skipped = 0
-    today = dt.date.today()
+    today = _myt_today()
     for i in range(days):
         day = (today - dt.timedelta(days=i)).isoformat()
         if i != 0 and not force and _day_has_rows(device_sn, day):
